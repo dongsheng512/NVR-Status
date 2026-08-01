@@ -1,7 +1,8 @@
 # 部署与分发文档
 
-> 适用版本：1.0.0  
-> 目标：同事 **安装即用**（状态巡检 + 可选深度抽检 + 多配置档案）
+> 适用版本：1.0.0（CustomTkinter GUI）  
+> 目标：同事 **安装即用**（状态巡检 + 可选深度抽检 + 多配置档案）  
+> **GUI 正重写为 PySide6（v2.0.0）**，见 [PLAN.md](PLAN.md)；本节打包步骤在 v2 发版时会同步改写（Qt 插件 / 依赖）。
 
 相关：打包脚本速查 [PACKAGING.md](../PACKAGING.md) · 使用说明 [USAGE.md](../USAGE.md) · ffmpeg [bin/README.md](../bin/README.md)
 
