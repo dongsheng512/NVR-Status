@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[oc]
+*.egg-info/
+wheels/
+.venv/
+
+# macOS / IDE
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# 本地设备配置（含账号密码，勿提交）
+nvr_config.json
+
+# 深度抽检保存的录像片段
+av_samples/
+
+# 打包产物
+dist/
+build/NVRStatus/
+*.spec.bak
+
+# 捆绑的 ffmpeg 二进制（体积大，见 bin/README.md）
+bin/ffmpeg
+bin/ffprobe
+bin/ffmpeg.exe
+bin/ffprobe.exe
+
+# 会话/临时笔记（非项目文档）
+cam.md

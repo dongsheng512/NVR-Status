@@ -1,0 +1,183 @@
+#!/usr/bin/env python3
+"""NVR 巡检入口: 默认查询 nvr_config.json 中全部设备; 也可指定单台。
+
+展示为 Rich 报告式布局（结论前置、异常优先）。加 --verbose 输出全量通道。
+"""
+from __future__ import annotations
+
+import os
+import subprocess
+import sys
+
+CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "nvr_config.json")
+PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+DEFAULT_CONFIG = {
+    "devices": [
+        {
+            "name": "NVR1",
+            "ip": "192.168.1.100",
+            "port": 80,
+            "username": "admin",
+            "password": "",
+            "ssl": False,
+        }
+    ],
+    "default": 0,
+}
+
+
+def _ensure_uv_env() -> None:
+    """若系统 Python 缺少依赖，通过 uv 在项目环境中重入。"""
+    if os.environ.get("_NVR_UV") == "1":
+        return
+    try:
+        import rich  # noqa: F401
+        import requests  # noqa: F401
+        return
+    except ImportError:
+        pass
+    env = os.environ.copy()
+    env["_NVR_UV"] = "1"
+    cmd = ["uv", "run", "python", os.path.abspath(__file__), *sys.argv[1:]]
+    raise SystemExit(subprocess.call(cmd, cwd=PROJECT_DIR, env=env))
+
+def load_config():
+    import json
+
+    if not os.path.exists(CONFIG_FILE):
+        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump(DEFAULT_CONFIG, f, indent=2, ensure_ascii=False)
+        print(f"已创建配置文件: {CONFIG_FILE}")
+        print("请编辑配置文件，添加你的 NVR 设备信息")
+        sys.exit(1)
+
+    with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _split_device_selector(argv: list[str]):
+    """解析设备选择与透传参数。返回 (indices|None, extra_args, help_only)."""
+    if not argv:
+        return None, [], False  # None indices → 全部
+    if argv[0] in ("-h", "--help"):
+        return None, [], True
+    if argv[0].lower() in ("all", "a", "*"):
+        return None, argv[1:], False
+    if argv[0].isdigit():
+        return [int(argv[0]) - 1], argv[1:], False
+    # 无设备号，全部参数都是扫描选项
+    return None, argv, False
+
+
+def main() -> None:
+    _ensure_uv_env()
+
+    from types import SimpleNamespace
+
+    from cli_report import collect_status, console, render_reports
+    from hikvision_status import build_arg_parser, nvr_from_args
+
+    config = load_config()
+    devices = config.get("devices") or []
+    if not devices:
+        print("错误: nvr_config.json 中没有 devices")
+        sys.exit(1)
+
+    indices, extra, help_only = _split_device_selector(sys.argv[1:])
+
+    if help_only:
+        print("用法: ./nvr [设备编号|all] [扫描参数...]")
+        print("")
+        print("  不带编号 / all   顺序查询配置中全部设备（默认）")
+        print("  数字编号         只查指定一台（从 1 开始）")
+        print("")
+        print("展示:")
+        print("  默认             站点摘要 + 每台结论 + 异常通道 + 硬盘条")
+        print("  -v / --verbose   输出全部通道与设备详情")
+        print("")
+        print("示例:")
+        print("  ./nvr")
+        print("  ./nvr all")
+        print("  ./nvr 1")
+        print("  ./nvr all --verbose")
+        print("  ./nvr all --deep-av-check --av-seconds 5")
+        print("  ./nvr 2 --av-save --av-limit 4")
+        print("")
+        print("可用设备:")
+        for i, dev in enumerate(devices, 1):
+            print(f"  {i}. {dev.get('name', f'设备{i}')} - {dev['ip']}")
+        print("")
+        print("扫描参数详见: uv run python hikvision_status.py -h")
+        sys.exit(0)
+
+    if indices is None:
+        indices = list(range(len(devices)))
+    else:
+        for idx in indices:
+            if idx < 0 or idx >= len(devices):
+                print(f"错误: 设备编号 {idx + 1} 不存在")
+                print("\n可用设备:")
+                for i, dev in enumerate(devices, 1):
+                    print(f"  {i}. {dev.get('name', f'设备{i}')} - {dev['ip']}")
+                sys.exit(1)
+
+    # 解析扫描参数（复用 hikvision_status 参数定义）
+    parser = build_arg_parser()
+    # 多设备模式下 ip/password 来自配置，允许缺失
+    try:
+        args = parser.parse_args(extra)
+    except SystemExit:
+        raise
+
+    verbose = bool(args.verbose)
+    total = len(indices)
+    console.print(
+        f"[bold]将查询 {total} 台设备[/]"
+        + (f"  [dim]| 附加参数: {' '.join(extra)}[/]" if extra else "")
+    )
+
+    reports = []
+    for n, idx in enumerate(indices, 1):
+        device = devices[idx]
+        name = device.get("name") or f"设备{idx + 1}"
+        ip = device.get("ip") or "?"
+        console.print(f"\n[bold cyan]▸ [{n}/{total}] {name} ({ip})[/]  采集中…")
+
+        # 合并设备连接信息到 args 副本
+        dev_args = SimpleNamespace(**vars(args))
+        dev_args.ip = device.get("ip")
+        dev_args.port = int(device.get("port") or 80)
+        dev_args.username = device.get("username") or "admin"
+        dev_args.password = device.get("password") or ""
+        dev_args.ssl = bool(device.get("ssl"))
+
+        try:
+            nvr = nvr_from_args(dev_args, quiet=False)
+            report = collect_status(nvr, device_name=name)
+            if not report.get("info"):
+                report["error"] = "无法获取设备信息，请检查 IP/账号/网络"
+            reports.append(report)
+        except Exception as e:
+            reports.append(
+                {
+                    "device_name": name,
+                    "ip": ip,
+                    "error": str(e),
+                    "info": {},
+                    "sys_status": {},
+                    "health": {},
+                    "alarms": [],
+                    "cameras": [],
+                    "records": [],
+                    "drives": [],
+                }
+            )
+
+    render_reports(reports, verbose=verbose)
+    if any(r.get("error") for r in reports):
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,19 @@
+[project]
+name = "cam"
+version = "1.0.0"
+description = "海康 NVR 状态巡检与音视频抽检（CLI + GUI）"
+requires-python = ">=3.11"
+dependencies = [
+    "requests>=2.32.5",
+    "customtkinter>=5.2.0",
+    "tksheet>=7.6.0",
+    "rich>=15.0.0",
+]
+
+[project.scripts]
+nvr-gui = "gui_app:main"
+
+[project.optional-dependencies]
+build = [
+    "pyinstaller>=6.0.0",
+]
