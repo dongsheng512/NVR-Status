@@ -132,7 +132,11 @@ cam-gui/
 | 文档 | 内容 |
 |------|------|
 | [USAGE.md](USAGE.md) | GUI / CLI 使用说明 |
-| [PACKAGING.md](PACKAGING.md) | Windows / macOS 打包与分发 |
+| [PACKAGING.md](PACKAGING.md) | Windows / macOS 打包速查 |
+| [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) | **部署与分发全文**（路径、发布流程、验收、排障） |
+| [docs/PLAN.md](docs/PLAN.md) | **产品与工程计划**（路线图、UI 选型决策、里程碑） |
+| [docs/analysis/](docs/analysis/) | UI 框架分析（wxPython / PySide6 / 现状栈） |
+| [docs/README.md](docs/README.md) | 文档目录索引 |
 | [bin/README.md](bin/README.md) | 捆绑 ffmpeg 说明 |
 
 ---
