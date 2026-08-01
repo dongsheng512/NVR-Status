@@ -1,31 +1,26 @@
-# UI 与架构分析文档
+# PySide6 重写 — 技术分析
 
-本目录汇总对 **当前技术栈**、**wxPython 重构**、**PySide6 对比选型**、**PySide6 落地注意点** 的评估结论，供计划与评审使用。
+GUI 已确定使用 **PySide6** 重写。本目录只保留与该决策相关的基线与落地分析。
 
 | 文档 | 内容 |
 |------|------|
-| [01-current-stack.md](01-current-stack.md) | 当前技术栈、架构、代码规模、痛点 |
-| [02-wxpython-eval.md](02-wxpython-eval.md) | 使用 wxPython 重构的优缺点与可行度 |
-| [03-wx-vs-pyside6.md](03-wx-vs-pyside6.md) | wxPython vs PySide6 项目级选型建议 |
-| [04-pyside6-details.md](04-pyside6-details.md) | PySide6 注意细节与可改进项、迁移顺序 |
+| [01-baseline.md](01-baseline.md) | 重写基线：现有架构、须复用模块、功能与痛点 |
+| [02-pyside6-notes.md](02-pyside6-notes.md) | PySide6 注意细节、控件映射、改进项、打包要点 |
 
-## 核心结论（一页纸）
+**执行计划（阶段 / 里程碑 / 清单）：** [../PLAN.md](../PLAN.md)
+
+## 决策摘要
 
 ```text
-1. 当前 CustomTkinter 方案对「内网巡检工具 + 已通打包」足够用。
-2. 业务（hikvision_status / config_store）与 UI 已分离，换 UI 壳技术可行。
-3. 全量换框架默认 ROI 偏低；优先局部修表与工程化拆分。
-4. 若必须离开 Tk：选 PySide6，不选 wxPython。
-5. 迁移前强制 1–2 天 POC（真机 + 至少一平台打包）。
+· 框架：PySide6（不用 wxPython，不再以 CTk 为 GUI 主线）
+· 范围：重写 GUI + 打包；复用 hikvision_status / config_store / CLI
+· 方式：新 ui/ 包 + Signal/Slot；通道表走 Model/View
+· 节奏：POC 关卡 → 功能对等 → 体验 → 双平台 v2.0.0
 ```
-
-## 与计划的关系
-
-路线图与里程碑见 [../PLAN.md](../PLAN.md)。  
-部署与分发见 [../DEPLOYMENT.md](../DEPLOYMENT.md)。
 
 ## 修订记录
 
 | 日期 | 说明 |
 |------|------|
-| 2026-08 | 初版：整理会话中的选型与 PySide6 分析入仓 |
+| 2026-08 | 初版含 wx 对比等多文档 |
+| 2026-08 | **精简为仅 PySide6 相关**；wx 文档移除 |

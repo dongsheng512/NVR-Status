@@ -3,7 +3,7 @@
 目标：**安装即用**，含状态巡检、深度音视频抽检、多配置档案、手动设备管理。
 
 > 更完整的部署说明（发布流程、数据路径、验收清单、排障）见 **[docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)**。  
-> 产品路线与 UI 迁移计划见 **[docs/PLAN.md](docs/PLAN.md)**。
+> **PySide6 GUI 重写计划**见 **[docs/PLAN.md](docs/PLAN.md)**（v2 打包将随重写更新本文/DEPLOYMENT）。
 
 ---
 
