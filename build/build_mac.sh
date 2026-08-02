@@ -5,7 +5,7 @@ cd "$(dirname "$0")/.."
 
 echo "==> 安装依赖"
 uv sync
-uv pip install pyinstaller customtkinter
+uv pip install pyinstaller
 
 # 可选: 复制系统 ffmpeg 到 bin/ 以便捆绑
 if [[ ! -f bin/ffmpeg ]] && command -v ffmpeg >/dev/null; then

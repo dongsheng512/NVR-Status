@@ -2,7 +2,7 @@
 
 海康威视 NVR **状态巡检**与**音视频深度抽检**工具，提供 **GUI** 与 **CLI** 两种入口，支持 Windows / macOS 打包分发。
 
-> 版本：`1.0.0` · 语言：Python ≥ 3.11
+> 版本：`2.0.0` · 语言：Python ≥ 3.11
 
 ---
 
@@ -25,8 +25,7 @@
 |------|------|------|
 | 语言 / 运行时 | **Python 3.11+** | 主程序 |
 | 包管理 | **[uv](https://github.com/astral-sh/uv)** + `pyproject.toml` / `uv.lock` | 依赖与可复现环境 |
-| GUI | **CustomTkinter** + **tkinter / ttk** | 主界面；通道表用 `ttk.Treeview` |
-| 表格相关 | **tksheet**（依赖中保留） | 可选/扩展表格能力 |
+| GUI | **PySide6**（Qt） | 主界面；通道表用 `QTableView` + Model/View |
 | HTTP / 设备协议 | **requests** + 海康 **ISAPI**（Digest 认证） | 设备信息、通道、录像、存储等 |
 | 流媒体抽检 | **ffmpeg / ffprobe**（RTSP） | 深度音视频抽检、样片保存 |
 | CLI 输出 | **rich** | 终端彩色报告 |
@@ -36,12 +35,13 @@
 ### 架构要点
 
 ```
-┌─────────────────┐     ┌──────────────────┐
-│  gui_app.py     │     │  nvr / CLI       │
-│  (CustomTkinter)│     │  cli_report.py   │
-└────────┬────────┘     └────────┬─────────┘
+┌───────────────────┐     ┌──────────────┐
+│  ui/  (PySide6)   │     │  nvr / CLI   │
+│  run_gui.py       │     │ cli_report.py│
+└────────┬──────────┘     └──────┬───────┘
          │                       │
-         ▼                       ▼
+         └──────────┬────────────┘
+                    ▼
 ┌─────────────────────────────────────────┐
 │  hikvision_status.py  (HikvisionNVR)    │
 │  ISAPI 查询 · 录像检查 · 深度 AV 抽检   │
@@ -53,8 +53,9 @@
 └──────────────────┘
 ```
 
-- GUI 用后台线程 `ScanWorker` + 消息队列更新进度，避免卡界面  
+- GUI 用后台线程 `ScanWorker` + Qt Signal 更新进度，避免卡界面  
 - 业务与 UI 分离，CLI / GUI 共用同一套巡检逻辑  
+- 导出逻辑在 `services/export_report.py`（无 Qt 依赖，GUI/CLI 共用）
 
 ---
 
@@ -65,8 +66,6 @@
 ```bash
 uv sync
 uv run python run_gui.py
-# 或
-uv run nvr-gui
 ```
 
 ### CLI
@@ -102,12 +101,13 @@ powershell -ExecutionPolicy Bypass -File build\build_win.ps1
 
 ```
 cam-gui/
-├── gui_app.py           # GUI 主程序
-├── run_gui.py           # GUI 入口
+├── run_gui.py           # GUI 入口 → ui.app.main
 ├── hikvision_status.py  # 海康 ISAPI / 抽检核心
 ├── config_store.py      # 配置档案
 ├── cli_report.py        # CLI 报告
 ├── nvr                  # CLI 启动脚本
+├── services/            # 无 Qt 依赖的纯逻辑（CSV/TXT 导出）
+├── ui/                  # PySide6 GUI（app / main_window / panels / widgets / theme）
 ├── nvr_config.example.json
 ├── NVRStatus.spec       # PyInstaller 规格
 ├── build/               # 打包脚本
@@ -123,6 +123,11 @@ cam-gui/
 
 - **不要**将含真实密码的 `nvr_config.json` 提交到 Git（已在 `.gitignore` 中忽略）。  
 - GUI 档案保存在本机用户目录，不在安装包内写死密码。  
+- **明文凭证提醒**：当前版本 NVR 账号密码以明文保存在 `profiles.json`
+  （macOS `~/Library/Application Support/NVRStatus/`，Windows `%APPDATA%\NVRStatus\`）。
+  - 请勿将该目录或文件拷贝、共享或上传到不受控环境；
+  - 多用户机器上建议为系统账号设置登录密码并保持目录仅本人可读写；
+  - 后续版本计划改用系统 keyring（Keychain / 凭据管理器）加密存储。
 - 内网工具：请仅在可信网络环境使用。
 
 ---
@@ -133,6 +138,7 @@ cam-gui/
 |------|------|
 | [USAGE.md](USAGE.md) | GUI / CLI 使用说明 |
 | [PACKAGING.md](PACKAGING.md) | Windows / macOS 打包速查 |
+| [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) | **开发交接：重写摘要、现状、已知问题、优化方向** |
 | [docs/PLAN.md](docs/PLAN.md) | **PySide6 GUI 重写计划**（阶段、对等清单、里程碑） |
 | [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) | 部署与分发全文（路径、发布流程、验收、排障） |
 | [docs/analysis/](docs/analysis/) | PySide6 重写技术分析（基线 + 落地注意点） |

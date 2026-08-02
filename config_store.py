@@ -53,7 +53,8 @@ def _empty_device() -> Dict[str, Any]:
 
 def _default_scan_options() -> Dict[str, Any]:
     return {
-        "lookback": 60,
+        "lookback": 60,  # 始终以分钟存储
+        "lookback_unit": "minute",  # minute | hour | day，仅影响 GUI 展示
         "no_search": False,
         "workers": 8,
         "deep_av_check": False,
@@ -63,6 +64,7 @@ def _default_scan_options() -> Dict[str, Any]:
         "silence_db": -80.0,
         "busy_start": 10,
         "busy_end": 18,
+        "busy_days_ago": 0,  # 0=今天, 1=昨天, … 抽检优先落在该日繁忙时段
         "av_save": False,
         "av_save_root": "",  # 空则用 default_av_save_root()
     }
@@ -190,10 +192,41 @@ class ConfigStore:
             prof["devices"] = [_empty_device()]
         return prof
 
+    def resolve_devices(self, name: Optional[str] = None) -> List[Dict[str, Any]]:
+        """返回设备的运行时视图: 密码为空时从 keyring 补全 (不可用则原样)。"""
+        from services import credentials
+
+        devices = self.get_profile(name).get("devices") or []
+        if not credentials.available():
+            return [deepcopy(d) for d in devices]
+        out = []
+        for d in devices:
+            d = deepcopy(d)
+            if not (d.get("password") or ""):
+                d["password"] = credentials.get_password(
+                    self.get_profile(name).get("name", ""), d
+                )
+            out.append(d)
+        return out
+
+    def _migrate_passwords(self, devices: List[Dict[str, Any]], profile_name: str) -> None:
+        """keyring 可用时把非空明文密码移入系统凭证, JSON 内置空。"""
+        from services import credentials
+
+        if not credentials.available():
+            return
+        for d in devices:
+            pw = d.get("password") or ""
+            if not pw:
+                continue
+            credentials.set_password(profile_name, d, pw)
+            d["password"] = ""
+
     def update_profile(self, name: Optional[str], profile: Dict[str, Any]) -> None:
         name = name or self.get_active_name()
         profile = deepcopy(profile)
         profile["name"] = name
+        self._migrate_passwords(profile.get("devices") or [], name)
         self.data["profiles"][name] = profile
         self.save()
 

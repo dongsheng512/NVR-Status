@@ -1,8 +1,8 @@
 # 部署与分发文档
 
-> 适用版本：1.0.0（CustomTkinter GUI）  
+> 适用版本：2.0.0（PySide6 GUI）  
 > 目标：同事 **安装即用**（状态巡检 + 可选深度抽检 + 多配置档案）  
-> **GUI 正重写为 PySide6（v2.0.0）**，见 [PLAN.md](PLAN.md)；本节打包步骤在 v2 发版时会同步改写（Qt 插件 / 依赖）。
+> GUI 已由 CustomTkinter 重写为 PySide6，见 [PLAN.md](PLAN.md)。
 
 相关：打包脚本速查 [PACKAGING.md](../PACKAGING.md) · 使用说明 [USAGE.md](../USAGE.md) · ffmpeg [bin/README.md](../bin/README.md)
 
@@ -48,7 +48,7 @@ cp nvr_config.example.json nvr_config.json
 |------|----------|
 | 应用图标 | `assets/` → 打入包内 |
 | 捆绑 ffmpeg | 构建时 `bin/ffmpeg`（及 ffprobe）→ 运行时从 `_MEIPASS` 或可执行文件旁 `bin/` 查找 |
-| Tcl/Tk / CustomTkinter | 由 PyInstaller `collect_all` 打入 |
+| Qt 平台插件 | PyInstaller 自动收集（Win `qwindows` / Mac `qcocoa`）；spec 已 exclude 未用 Qt 模块 |
 
 ---
 
@@ -68,8 +68,7 @@ uv sync
 
 # GUI
 uv run python run_gui.py
-# 或
-uv run nvr-gui
+# 注：`nvr-gui` 命令因项目未声明 build-system 暂不可用（见 DEVELOPMENT.md §3.1）
 
 # CLI
 ./nvr -h
@@ -93,7 +92,7 @@ uv pip install pyinstaller
 
 - [ ] `uv sync` 成功，GUI 开发模式可启动  
 - [ ] （推荐）`bin/` 已放入对应平台的 ffmpeg / ffprobe  
-- [ ] 版本号与 `gui_app.APP_VERSION` / 文档一致  
+- [ ] 版本号与 `ui.main_window.APP_VERSION` / 文档一致  
 - [ ] 未把含真实密码的配置打进仓库或安装包  
 - [ ] 在 **目标平台** 的干净目录执行构建  
 
@@ -105,7 +104,7 @@ uv pip install pyinstaller
 
 脚本行为摘要：
 
-1. `uv sync` + 安装 PyInstaller / customtkinter  
+1. `uv sync` + 安装 PyInstaller  
 2. 若无 `bin/ffmpeg` 且系统有 ffmpeg，则复制到 `bin/`  
 3. `uv run pyinstaller --noconfirm NVRStatus.spec`  
 
@@ -116,7 +115,7 @@ uv pip install pyinstaller
 
 **分发给同事：**
 
-1. 打 zip：`NVRStatus-macOS-1.0.0.zip`  
+1. 打 zip：`NVRStatus-macOS-2.0.0.zip`  
 2. 解压后拖到「应用程序」  
 3. 若无法打开（未签名）：
 
@@ -139,7 +138,7 @@ powershell -ExecutionPolicy Bypass -File build\build_win.ps1
 
 **分发：**
 
-1. 整夹压缩为 `NVRStatus-Windows-1.0.0.zip`  
+1. 整夹压缩为 `NVRStatus-Windows-2.0.0.zip`  
 2. 用户解压后双击 `NVRStatus.exe`  
 3. （可选）用 Inno Setup / NSIS 做成安装程序  
 
@@ -148,17 +147,17 @@ powershell -ExecutionPolicy Bypass -File build\build_win.ps1
 ### 4.4 手动 PyInstaller
 
 ```bash
-uv pip install pyinstaller customtkinter
+uv pip install pyinstaller
 uv run pyinstaller --noconfirm NVRStatus.spec
 ```
 
-规格文件：`NVRStatus.spec`（入口 `run_gui.py`，`console=False`，macOS 含 BUNDLE）。
+规格文件：`NVRStatus.spec`（入口 `run_gui.py`，`console=False`，macOS 含 BUNDLE；PySide6 自动带 Qt 平台插件，已 exclude 未用 Qt 模块）。
 
 ### 4.5 体积粗估
 
 | 内容 | 约 |
 |------|-----|
-| GUI + Python 运行时 + CTk | 40–80 MB |
+| GUI + Python 运行时 + PySide6 | 80–160 MB |
 | + 捆绑 ffmpeg/ffprobe | 再 +50–120 MB |
 
 ---
@@ -241,7 +240,7 @@ uv run pyinstaller --noconfirm NVRStatus.spec
 | 深度抽检跳过 | 无 ffmpeg | 安装或捆绑到 `bin/` |
 | 进度卡住 | 网络慢 / 通道多 / RTSP 超时 | 减小 `av_limit`、workers；看日志阶段 |
 | 配置丢失 | 清了用户目录或换了账号 | 从导出档案恢复 |
-| 打包后无界面 / 闪退 | 缺资源或 Tcl | 查 `warn-*.txt`；用 `console=True` 临时诊断 |
+| 打包后无界面 / 闪退 | 缺资源或 Qt 插件 | 查 `logs/crash_*.log`；用 `console=True` 临时诊断 |
 | Win 杀软误报 | PyInstaller 常见 | 加白名单；正式可代码签名 |
 
 开发机调试打包应用时，可临时将 `NVRStatus.spec` 中 `console=False` 改为 `True` 查看报错（勿用于正式分发）。
@@ -270,10 +269,11 @@ GitHub Actions
 
 | 入口文件 | 用途 |
 |----------|------|
-| `run_gui.py` / `gui_app.py` | GUI（打包入口） |
-| `nvr` / `cli_report.py` | CLI |
-| `hikvision_status.py` | ISAPI + 抽检核心 |
+| `run_gui.py` → `ui.app` / `ui/` | GUI（打包入口，PySide6） |
+| `nvr` / `cli_report.py` | CLI（委托 `nvr_core/scan_runner.py`） |
+| `hikvision_status.py` / `nvr_core/` | ISAPI + 抽检核心（兼容门面 / 实现包） |
 | `config_store.py` | 多档案配置 |
+| `services/export_report.py` | CSV/TXT 导出（GUI/CLI 共用） |
 | `NVRStatus.spec` | PyInstaller 规格 |
 | `build/build_mac.sh` | macOS 构建 |
 | `build/build_win.ps1` | Windows 构建 |

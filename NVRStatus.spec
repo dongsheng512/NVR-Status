@@ -1,6 +1,6 @@
 # -*- mode: python ; coding: utf-8 -*-
-# PyInstaller 配置: 在对应平台上执行
-#   uv run pyinstaller NVRStatus.spec
+# PyInstaller 配置 (PySide6): 在对应平台上执行
+#   uv run pyinstaller --noconfirm NVRStatus.spec
 #
 # 可选: 将 ffmpeg/ffprobe 放入 bin/ 后一并打包(安装即用深度抽检)
 # 图标: assets/AppIcon.icns (macOS) / assets/AppIcon.ico (Windows)
@@ -8,11 +8,10 @@
 import os
 import sys
 
-from PyInstaller.utils.hooks import collect_all
-
 block_cipher = None
 root = os.path.abspath('.')
 
+# 捆绑 bin/ 下的 ffmpeg/ffprobe(可选)
 bins = []
 bin_dir = os.path.join(root, 'bin')
 if os.path.isdir(bin_dir):
@@ -20,13 +19,6 @@ if os.path.isdir(bin_dir):
         p = os.path.join(bin_dir, name)
         if os.path.isfile(p) and not name.endswith('.md'):
             bins.append((p, 'bin'))
-
-# customtkinter / tksheet 资源
-ctk_datas, ctk_binaries, ctk_hidden = collect_all('customtkinter')
-try:
-    ts_datas, ts_binaries, ts_hidden = collect_all('tksheet')
-except Exception:
-    ts_datas, ts_binaries, ts_hidden = [], [], []
 
 # 应用图标
 icon_icns = os.path.join(root, 'assets', 'AppIcon.icns')
@@ -39,21 +31,61 @@ elif sys.platform == 'win32' and os.path.isfile(icon_ico):
 else:
     app_icon = None
 
-extra_datas = list(ctk_datas) + list(ts_datas)
+# PySide6 是 LGPL: 动态链接即可,无需 collect_all(打包器自带 hook)
+# 仅附带应用图标资源
+datas = []
 if os.path.isfile(icon_png):
-    extra_datas.append((icon_png, 'assets'))
+    datas.append((icon_png, 'assets'))
+
+# 精简无用 Qt 模块,显著减小体积
+excludes = [
+    'PySide6.QtWebEngineCore',
+    'PySide6.QtWebEngineWidgets',
+    'PySide6.QtWebChannel',
+    'PySide6.Qt3DCore',
+    'PySide6.Qt3DRender',
+    'PySide6.Qt3DExtras',
+    'PySide6.QtBluetooth',
+    'PySide6.QtMultimedia',
+    'PySide6.QtMultimediaWidgets',
+    'PySide6.QtQml',
+    'PySide6.QtQuick',
+    'PySide6.QtQuickWidgets',
+    'PySide6.QtPdf',
+    'PySide6.QtPdfWidgets',
+    'PySide6.QtCharts',
+    'PySide6.QtDataVisualization',
+    'PySide6.QtDesigner',
+    'PySide6.QtHelp',
+    'PySide6.QtLocation',
+    'PySide6.QtNfc',
+    'PySide6.QtOpenGL',
+    'PySide6.QtOpenGLWidgets',
+    'PySide6.QtPositioning',
+    'PySide6.QtPrintSupport',
+    'PySide6.QtRemoteObjects',
+    'PySide6.QtScxml',
+    'PySide6.QtSensors',
+    'PySide6.QtSerialPort',
+    'PySide6.QtSql',
+    'PySide6.QtTest',
+    'PySide6.QtTextToSpeech',
+    'PySide6.QtWebSockets',
+    'tkinter',
+    'customtkinter',
+    'tksheet',
+]
 
 a = Analysis(
     ['run_gui.py'],
     pathex=[root],
-    binaries=bins + ctk_binaries + ts_binaries,
-    datas=extra_datas,
-    hiddenimports=['customtkinter', 'tksheet', 'requests', 'urllib3']
-    + list(ctk_hidden) + list(ts_hidden),
+    binaries=bins,
+    datas=datas,
+    hiddenimports=['requests', 'urllib3'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[],
+    excludes=excludes,
     win_no_prefer_redirects=False,
     win_private_assemblies=False,
     cipher=block_cipher,
@@ -101,7 +133,7 @@ if sys.platform == 'darwin':
         bundle_identifier='com.local.nvrstatus',
         info_plist={
             'NSHighResolutionCapable': True,
-            'CFBundleShortVersionString': '1.0.0',
+            'CFBundleShortVersionString': '2.0.0',
             'CFBundleName': 'NVRStatus',
             'CFBundleDisplayName': 'NVR 状态巡检',
         },

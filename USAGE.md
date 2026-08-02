@@ -309,6 +309,19 @@ uv run hikvision_status.py \
 - 工作日白天做人流较多时段的深度抽检（默认已优先 10:00–18:00）
 - 全量 64 路抽检大约数分钟～十几分钟，错峰或先用 `--av-limit` 抽样
 
+### 8.1 凭证安全（A7）
+
+- GUI 档案中的 NVR 密码以**明文**存于 `profiles.json`（用户目录，见下表）。
+- 请勿把 `profiles.json` / `nvr_config.json` 提交、共享或上传到不受控环境。
+- 多用户机器：为系统账号设置登录密码，并收紧目录权限（macOS 保持
+  `~/Library/Application Support/NVRStatus/` 仅本人可读写）。
+- 计划后续改用系统 keyring（macOS Keychain / Windows 凭据管理器）加密存储。
+
+| 平台 | profiles.json 路径 |
+|------|--------------------|
+| macOS | `~/Library/Application Support/NVRStatus/profiles.json` |
+| Windows | `%APPDATA%\NVRStatus\profiles.json` |
+
 ---
 
 ## 9. 项目文件

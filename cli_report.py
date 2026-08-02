@@ -341,9 +341,24 @@ def render_device_report(report: Dict[str, Any], *, verbose: bool = False) -> No
         for d in detail_lines:
             console.print(Text(f"  ↳ {d}", style="dim yellow"))
 
-    # --- Disks ---
+    # --- Disks / overwrite ---
     console.print()
     console.print(Rule(f"硬盘  ·  {len(drives)} 块", style="cyan"))
+    ow = report.get("disk_overwrite") or (report.get("health") or {}).get("循环覆盖") or {}
+    if ow:
+        lab = ow.get("label") or "未知"
+        en = ow.get("enabled")
+        if en is True:
+            style = "green"
+        elif en is False:
+            style = "yellow" if "推断" in str(lab) else "red"
+        else:
+            style = "dim"
+        detail = ow.get("detail") or ""
+        console.print(
+            Text(f"  循环覆盖: {lab}", style=style)
+            + (Text(f"  ·  {detail}", style="dim") if detail else Text(""))
+        )
     if not drives:
         console.print(Text("  未检测到硬盘", style="yellow"))
     else:
@@ -577,32 +592,7 @@ def collect_status(
     *,
     device_name: str = "",
 ) -> Dict[str, Any]:
-    """Gather all status fields from a connected HikvisionNVR instance."""
-    info = nvr.get_device_info()
-    sys_status = nvr.get_system_status()
-    cameras = nvr.get_cameras()
-    records = nvr.get_recording_status()
-    health = nvr.get_health_summary()
-    alarms = nvr.get_alarm_status()
-    drives = nvr.get_storage_status()
-    return {
-        "device_name": device_name or (info or {}).get("设备名称") or nvr.ip,
-        "ip": nvr.ip,
-        "info": info or {},
-        "sys_status": sys_status or {},
-        "health": health or {},
-        "alarms": alarms or [],
-        "cameras": cameras or [],
-        "records": records or [],
-        "drives": drives or [],
-        "lookback_minutes": nvr.lookback_minutes,
-        "deep_av_check": nvr.deep_av_check,
-        "av_seconds": nvr.av_seconds,
-        "av_workers": nvr.av_workers,
-        "busy_start_hour": nvr.busy_start_hour,
-        "busy_end_hour": nvr.busy_end_hour,
-        "av_save": nvr.av_save,
-        "av_save_dir": nvr.av_save_dir,
-        "check_disk_recording": nvr.check_disk_recording,
-        "error": None,
-    }
+    """采集单台设备状态（委托 nvr_core.scan_runner 统一编排）。"""
+    from nvr_core.scan_runner import run_nvr
+
+    return run_nvr(nvr, device_name=device_name)

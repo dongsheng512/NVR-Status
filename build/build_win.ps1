@@ -5,7 +5,7 @@ Set-Location (Join-Path $PSScriptRoot "..")
 
 Write-Host "==> 安装依赖"
 uv sync
-uv pip install pyinstaller customtkinter
+uv pip install pyinstaller
 
 # 可选: 将 ffmpeg.exe / ffprobe.exe 放到 bin\ 后重新打包即可捆绑
 if (-not (Test-Path "bin\ffmpeg.exe")) {

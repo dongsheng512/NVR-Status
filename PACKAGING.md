@@ -3,7 +3,7 @@
 目标：**安装即用**，含状态巡检、深度音视频抽检、多配置档案、手动设备管理。
 
 > 更完整的部署说明（发布流程、数据路径、验收清单、排障）见 **[docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)**。  
-> **PySide6 GUI 重写计划**见 **[docs/PLAN.md](docs/PLAN.md)**（v2 打包将随重写更新本文/DEPLOYMENT）。
+> **PySide6 GUI 重写计划**见 **[docs/PLAN.md](docs/PLAN.md)**（v2.0.0 已重写为 PySide6）。
 
 ---
 
@@ -13,8 +13,7 @@
 cd cam
 uv sync
 uv run python run_gui.py
-# 或
-uv run nvr-gui
+# 注：`nvr-gui` 命令暂不可用（项目未声明 build-system，见 docs/DEVELOPMENT.md §3.1）
 ```
 
 配置档案保存在：
@@ -80,7 +79,7 @@ powershell -ExecutionPolicy Bypass -File build\build_win.ps1
 ### 3.3 手动 PyInstaller
 
 ```bash
-uv pip install pyinstaller customtkinter
+uv pip install pyinstaller
 uv run pyinstaller --noconfirm NVRStatus.spec
 ```
 
@@ -104,7 +103,7 @@ CLI 仍可用：`./nvr 1`，见 [USAGE.md](USAGE.md)。
 
 | 内容 | 约 |
 |------|-----|
-| 仅 GUI + requests | 40–80 MB |
+| 仅 GUI + requests + PySide6 | 80–160 MB |
 | + 捆绑 ffmpeg | 再 +50–120 MB |
 
 ---
