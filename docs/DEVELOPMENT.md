@@ -98,7 +98,7 @@ QT_QPA_PLATFORM=offscreen uv run pytest   # 33 例：导出 / 通道筛选排序
 | 项 | 状态 | 说明 |
 |----|------|------|
 | **真机 NVR 验收** | 待做 | 阶段 1 关卡；跑一次完整快速/深度巡检，核对进度文案与结果区 |
-| **PyInstaller 打包验收** | 待做 | spec/脚本已更新，未在 Win + Mac 实际构建；PySide6 体积粗估 80–160 MB（+ffmpeg 再 +50–120 MB） |
+| **PyInstaller 打包验收** | 部分 | macOS 已构建；体积优化后 full ~172MB / lite ~74MB（zip 72/29MB）；Win 待目标机验收 |
 
 ---
 

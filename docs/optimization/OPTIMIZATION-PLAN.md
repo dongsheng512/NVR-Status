@@ -300,6 +300,7 @@ QT_QPA_PLATFORM=offscreen uv run pytest
 | 2026-08-02 | 执行阶段 B：B1/B2/B3/B4/B5/B6/B7/B8 全部完成，阶段 B 收官 |
 | 2026-08-02 | **进度复核**：对照代码/测试独立验证；见下文 §10 |
 | 2026-08-05 | **除虫/收尾**：Windows keyring 多设备 TargetName、keyring 写入失败不丢密、档案 rename/delete/clone 凭证生命周期、队列失败也归档、pyproject 补 `nvr_core`/`ui.panels`、文档同步 B7 |
+| 2026-08-05 | **体积优化**：spec 过滤未用 Qt 框架/插件/翻译、排除 rich/CLI；`build_mac.sh --lite` / `build_win.ps1 -Lite`；macOS arm64 实测 full 172MB/72MB zip、lite 74MB/29MB zip（基线 204/86） |
 
 ---
 

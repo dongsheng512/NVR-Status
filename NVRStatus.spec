@@ -2,8 +2,14 @@
 # PyInstaller 配置 (PySide6): 在对应平台上执行
 #   uv run pyinstaller --noconfirm NVRStatus.spec
 #
+# 环境变量:
+#   NVR_LITE=1          不捆绑 ffmpeg/ffprobe（体积最小；深度抽检需系统 PATH）
+#   NVR_BUNDLE_FFMPEG=0 同上
+#
 # 可选: 将 ffmpeg/ffprobe 放入 bin/ 后一并打包(安装即用深度抽检)
 # 图标: assets/AppIcon.icns (macOS) / assets/AppIcon.ico (Windows)
+#
+# 体积优化: Analysis 后过滤未使用的 Qt 框架/插件/翻译（excludes 只挡 Python 模块）
 
 import os
 import sys
@@ -11,10 +17,14 @@ import sys
 block_cipher = None
 root = os.path.abspath('.')
 
-# 捆绑 bin/ 下的 ffmpeg/ffprobe(可选)
+# ---- 是否捆绑 ffmpeg ----
+_lite = os.environ.get("NVR_LITE", "").strip().lower() in ("1", "true", "yes")
+_no_ff = os.environ.get("NVR_BUNDLE_FFMPEG", "1").strip().lower() in ("0", "false", "no")
+bundle_ffmpeg = not (_lite or _no_ff)
+
 bins = []
 bin_dir = os.path.join(root, 'bin')
-if os.path.isdir(bin_dir):
+if bundle_ffmpeg and os.path.isdir(bin_dir):
     for name in os.listdir(bin_dir):
         p = os.path.join(bin_dir, name)
         if os.path.isfile(p) and not name.endswith('.md'):
@@ -32,12 +42,11 @@ else:
     app_icon = None
 
 # PySide6 是 LGPL: 动态链接即可,无需 collect_all(打包器自带 hook)
-# 仅附带应用图标资源
 datas = []
 if os.path.isfile(icon_png):
     datas.append((icon_png, 'assets'))
 
-# 精简无用 Qt 模块,显著减小体积
+# 精简无用 Qt 模块（Python 层）
 excludes = [
     'PySide6.QtWebEngineCore',
     'PySide6.QtWebEngineWidgets',
@@ -71,10 +80,133 @@ excludes = [
     'PySide6.QtTest',
     'PySide6.QtTextToSpeech',
     'PySide6.QtWebSockets',
+    'PySide6.QtVirtualKeyboard',
     'tkinter',
     'customtkinter',
     'tksheet',
+    'pytest',
+    'unittest',
+    # CLI 专用（GUI 入口不需要；rich 会连带 pygments 膨胀数 MB）
+    'rich',
+    'pygments',
+    'cli_report',
+    'markdown_it',
+    'mdurl',
 ]
+
+
+def _norm(path: str) -> str:
+    return path.replace('\\', '/')
+
+
+# 必须丢弃的路径片段（framework / plugin / 翻译）
+# 业务仅用 Widgets + PNG logo + QSS 引用临时 SVG（需 QtSvg）
+_DROP_SUBSTRINGS = (
+    # 未使用框架（hook 会经插件拖入）
+    'QtPdf',
+    'QtQml',
+    'QtQuick',
+    'QtVirtualKeyboard',
+    'QtOpenGL',
+    'Qt3D',
+    'QtMultimedia',
+    'QtWebEngine',
+    'QtCharts',
+    'QtDataVisualization',
+    'QtPositioning',
+    'QtLocation',
+    'QtSensors',
+    'QtSerialPort',
+    'QtSql',
+    'QtTest',
+    'QtBluetooth',
+    'QtNfc',
+    'QtRemoteObjects',
+    'QtScxml',
+    'QtTextToSpeech',
+    'QtWebSockets',
+    'QtWebChannel',
+    'QtPrintSupport',
+    'QtDesigner',
+    'QtHelp',
+    # 全量翻译（应用文案中文硬编码；匹配 PySide6/Qt/translations/...）
+    'translations/',
+    '/translations',
+    # 多余 imageformats（保留 gif/ico/jpeg/svg）
+    'libqpdf',
+    'qpdf.dll',
+    'libqmacheif',
+    'qmacheif.dll',
+    'libqmacjp2',
+    'qmacjp2.dll',
+    'libqtga',
+    'qtga.dll',
+    'libqtiff',
+    'qtiff.dll',
+    'libqwebp',
+    'qwebp.dll',
+    'libqwbmp',
+    'qwbmp.dll',
+    # 非目标平台 / 调试用平台插件
+    'libqminimal',
+    'qminimal.dll',
+    'libqoffscreen',
+    'qoffscreen.dll',
+    'libqeglfs',
+    'libqvnc',
+    'libqlinuxfb',
+    # 虚拟键盘输入法
+    'libqtvirtualkeyboard',
+    'qtvirtualkeyboard',
+    'platforminputcontexts',
+    # 杂项
+    'Lorem ipsum',
+)
+
+# 平台相关：丢弃对方平台的平台插件（双保险）
+if sys.platform == 'darwin':
+    _DROP_SUBSTRINGS = _DROP_SUBSTRINGS + (
+        'qwindows',
+        'qwindowsvistastyle',
+        'qdirect2d',
+    )
+elif sys.platform == 'win32':
+    _DROP_SUBSTRINGS = _DROP_SUBSTRINGS + (
+        'libqcocoa',
+        'libqmacstyle',
+        'qcocoa',
+        'qmacstyle',
+    )
+
+
+def _should_drop(name: str) -> bool:
+    """是否从包中剔除。保留 Core/Gui/Widgets/Network/DBus/Svg 与必要插件。"""
+    n = _norm(name)
+    for s in _DROP_SUBSTRINGS:
+        if s in n:
+            return True
+    return False
+
+
+def _filter_toc(toc):
+    """过滤 (dest_name, src_path, typecode) 三元组列表。"""
+    kept = []
+    dropped = []
+    for entry in toc:
+        name = entry[0]
+        if _should_drop(name):
+            dropped.append(name)
+        else:
+            kept.append(entry)
+    if dropped:
+        # 构建日志里可见
+        print(f'[NVRStatus.spec] dropped {len(dropped)} binaries/datas for size:')
+        for d in sorted(set(_norm(x) for x in dropped))[:40]:
+            print(f'  - {d}')
+        if len(dropped) > 40:
+            print(f'  ... and {len(dropped) - 40} more')
+    return kept
+
 
 a = Analysis(
     ['run_gui.py'],
@@ -83,13 +215,34 @@ a = Analysis(
     datas=datas,
     hiddenimports=['requests', 'urllib3'],
     hookspath=[],
-    hooksconfig={},
+    hooksconfig={
+        # 尽量少收集翻译；真正剔除仍靠下方 filter
+        'PySide6': {
+            'module_collection_mode': 'pyz+py',
+        },
+    },
     runtime_hooks=[],
     excludes=excludes,
     win_no_prefer_redirects=False,
     win_private_assemblies=False,
     cipher=block_cipher,
     noarchive=False,
+)
+
+# 关键：原生 Qt 框架/插件不吃 excludes，在此裁剪
+a.binaries = _filter_toc(a.binaries)
+a.datas = _filter_toc(a.datas)
+
+# 去掉 Analysis 产生的空壳 Qt* 符号链接占位（若有）
+# 以及 setuptools 测试文本等
+a.datas = [
+    d for d in a.datas
+    if 'Lorem ipsum' not in _norm(d[0]) and 'setuptools/_vendor' not in _norm(d[0])
+]
+
+print(
+    f'[NVRStatus.spec] bundle_ffmpeg={bundle_ffmpeg} '
+    f'binaries={len(a.binaries)} datas={len(a.datas)}'
 )
 
 pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
@@ -103,8 +256,8 @@ exe = EXE(
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    upx=True,
-    console=False,  # GUI 无控制台
+    upx=False,  # macOS arm64 / 签名场景下 UPX 收益差且易出问题
+    console=False,
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=None,
@@ -119,7 +272,7 @@ coll = COLLECT(
     a.zipfiles,
     a.datas,
     strip=False,
-    upx=True,
+    upx=False,
     upx_exclude=[],
     name='NVRStatus',
 )

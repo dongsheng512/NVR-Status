@@ -10,10 +10,9 @@
 ## 1. 运行 GUI（开发模式）
 
 ```bash
-cd cam
 uv sync
 uv run python run_gui.py
-# 注：`nvr-gui` 命令暂不可用（项目未声明 build-system，见 docs/DEVELOPMENT.md §3.1）
+# 或: uv run nvr-gui
 ```
 
 配置档案保存在：
@@ -28,16 +27,14 @@ uv run python run_gui.py
 
 ---
 
-## 2. 捆绑 ffmpeg（深度抽检必用）
+## 2. 捆绑 ffmpeg（深度抽检）
 
-打包前把二进制放进 `bin/`：
-
-见 [bin/README.md](bin/README.md)。
+打包前把二进制放进 `bin/`（见 [bin/README.md](bin/README.md)）：
 
 - macOS: `bin/ffmpeg` + `bin/ffprobe`
 - Windows: `bin/ffmpeg.exe` + `bin/ffprobe.exe`
 
-不捆绑也能跑 GUI，但勾选「深度抽检 / 保存片段」时会提示缺少工具。
+不捆绑也能跑 GUI（**lite 包**）；深度抽检会提示缺少工具，或使用系统 PATH 中的 ffmpeg。
 
 ---
 
@@ -46,18 +43,22 @@ uv run python run_gui.py
 ### 3.1 macOS
 
 ```bash
+# 完整包（有 bin/ffmpeg 则捆绑）
 ./build/build_mac.sh
+
+# 精简包（不捆绑 ffmpeg，体积更小）
+./build/build_mac.sh --lite
 ```
 
 产物：
 
-- `dist/NVRStatus.app`（若 BUNDLE 成功）
-- 或 `dist/NVRStatus/` 目录
+- `dist/NVRStatus/` 或 `dist/NVRStatus.app`
+- zip：`dist/NVRStatus-macOS-<arch>.zip` 或 `…-lite.zip`
 
 分发：
 
-1. 压缩为 `NVRStatus-macOS.zip` 发给用户  
-2. 用户解压后拖到「应用程序」  
+1. 将 zip 发给用户  
+2. 解压后拖到「应用程序」  
 3. 若提示无法打开：`xattr -cr /Applications/NVRStatus.app`，或在「隐私与安全性」中允许  
 
 正式对外分发需 Apple 开发者签名 + 公证（本仓库默认不签名）。
@@ -67,7 +68,11 @@ uv run python run_gui.py
 在 **Windows 机器**上：
 
 ```powershell
+# 完整包
 powershell -ExecutionPolicy Bypass -File build\build_win.ps1
+
+# 精简包
+powershell -ExecutionPolicy Bypass -File build\build_win.ps1 -Lite
 ```
 
 产物：`dist\NVRStatus\`（内含 `NVRStatus.exe`）
@@ -76,16 +81,48 @@ powershell -ExecutionPolicy Bypass -File build\build_win.ps1
 
 > **注意：必须在目标系统上打包。** Mac 打不出原生 Windows exe，反之亦然。可用两台机器或 GitHub Actions 双矩阵 CI。
 
-### 3.3 手动 PyInstaller
+### 3.3 手动 PyInstaller / 环境变量
 
 ```bash
-uv pip install pyinstaller
+uv pip install "pyinstaller>=6.0.0"
 uv run pyinstaller --noconfirm NVRStatus.spec
+
+# 不捆绑 ffmpeg:
+NVR_LITE=1 uv run pyinstaller --noconfirm NVRStatus.spec
+# 或:
+NVR_BUNDLE_FFMPEG=0 uv run pyinstaller --noconfirm NVRStatus.spec
 ```
 
 ---
 
-## 4. 软件功能对照
+## 4. 体积优化说明
+
+`NVRStatus.spec` 在 Analysis 之后会**过滤未使用的 Qt 原生库与插件**（仅 `excludes` 挡不住 framework/plugin）：
+
+| 剔除 | 说明 |
+|------|------|
+| QtPdf / QtQml / QtQuick / QtVirtualKeyboard / QtOpenGL 等 | 业务仅用 Widgets |
+| Qt translations（全部 .qm） | 界面文案中文硬编码 |
+| 多余 imageformats | 保留 gif / ico / jpeg / **svg**（QSS 箭头） |
+| minimal / offscreen 平台插件 | 正式 GUI 只需 cocoa / windows |
+| UPX | macOS arm64 默认关闭 |
+
+### 实测（macOS arm64，2026-08-05，本机构建）
+
+| 包型 | 磁盘 | zip | 内容 |
+|------|------|-----|------|
+| 优化前（基线） | **204 MB** | **86 MB** | 未裁 Qt 插件/翻译 + evermeet ffmpeg×2 |
+| **full**（`./build/build_mac.sh`） | **172 MB** | **72 MB** | Qt 裁剪 + 剔 rich/CLI + 捆绑 ffmpeg |
+| **lite**（`./build/build_mac.sh --lite`） | **74 MB** | **29 MB** | 同上但不捆绑 ffmpeg |
+
+相对基线：**full 约 −16% 磁盘 / −16% zip**；**lite 约 −64% 磁盘 / −66% zip**。  
+lite 包已做冷启动冒烟（进程可起）。
+
+> 最大剩余体积来自 **ffmpeg 全量静态构建（各 ~49 MB）**。若需再压 full 包，请改用 essentials / 精简构建替换 `bin/ffmpeg`（见 bin/README）。
+
+---
+
+## 5. 软件功能对照
 
 | 功能 | 说明 |
 |------|------|
@@ -99,18 +136,10 @@ CLI 仍可用：`./nvr 1`，见 [USAGE.md](USAGE.md)。
 
 ---
 
-## 5. 体积与依赖粗估
-
-| 内容 | 约 |
-|------|-----|
-| 仅 GUI + requests + PySide6 | 80–160 MB |
-| + 捆绑 ffmpeg | 再 +50–120 MB |
-
----
-
 ## 6. 安全说明
 
 - 配置与密码存在**本机用户目录**，不写死在安装包内  
+- macOS / Windows 优先使用系统 keyring；失败时回退 JSON 明文  
 - 请勿把含密码的 `profiles.json` 提交到公开仓库  
 - 应用仅访问你配置的 NVR 地址，需网络可达  
 
@@ -120,6 +149,8 @@ CLI 仍可用：`./nvr 1`，见 [USAGE.md](USAGE.md)。
 
 - [ ] 无 ffmpeg 时可完成状态/落盘巡检  
 - [ ] 有 ffmpeg 时可深度抽检且 OSD 时间为本地繁忙时段  
+- [ ] lite 包启动正常、主题与通道表正常（含下拉箭头 SVG）  
 - [ ] 可新建第二套档案、切换、互不覆盖  
 - [ ] 可增删设备并保存  
 - [ ] Win / Mac 各自构建出可双击启动的应用  
+- [ ] 记录 full / lite 的 `du -sh` 与 zip 大小  
