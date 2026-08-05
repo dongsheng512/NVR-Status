@@ -133,23 +133,88 @@ def _resource_dir() -> str:
     return _project_dir()
 
 
+def _tool_bin_dirs() -> list[str]:
+    """可能存放 ffmpeg/ffprobe 的目录（开发树 / onedir / macOS .app）。"""
+    dirs: list[str] = []
+
+    def _add(path: str) -> None:
+        if not path:
+            return
+        p = os.path.normpath(path)
+        if p not in dirs:
+            dirs.append(p)
+
+    # 开发布局 & 通用
+    _add(os.path.join(_resource_dir(), "bin"))
+    _add(os.path.join(_project_dir(), "bin"))
+    _add(os.path.join(_project_dir(), "ffmpeg", "bin"))
+    _add(os.path.join(_project_dir(), "_internal", "bin"))
+
+    if getattr(sys, "frozen", False):
+        exe_dir = os.path.dirname(os.path.abspath(sys.executable))
+        # Windows / Linux onedir: <app>/_internal/bin 或 <app>/bin
+        _add(os.path.join(exe_dir, "bin"))
+        _add(os.path.join(exe_dir, "_internal", "bin"))
+
+        # macOS .app: Contents/MacOS/<exe>
+        #   二进制在 Contents/Frameworks/bin（真实文件）
+        #   Contents/Resources/bin 常为指向 Frameworks 的符号链接
+        #   _MEIPASS 在不同 PyInstaller 版本可能是 Frameworks 或 Resources
+        contents = os.path.dirname(exe_dir)  # .../Contents
+        _add(os.path.join(contents, "Frameworks", "bin"))
+        _add(os.path.join(contents, "Resources", "bin"))
+        _add(os.path.join(contents, "MacOS", "bin"))
+        _add(os.path.join(contents, "_internal", "bin"))
+
+        meipass = getattr(sys, "_MEIPASS", None)
+        if meipass:
+            _add(os.path.join(meipass, "bin"))
+            parent = os.path.dirname(meipass)
+            _add(os.path.join(parent, "bin"))
+            _add(os.path.join(parent, "Frameworks", "bin"))
+            _add(os.path.join(parent, "Resources", "bin"))
+
+    return dirs
+
+
+def _is_runnable_binary(path: str) -> bool:
+    """判断路径是否可作为外部工具调用。
+
+    不用强依赖 os.X_OK：部分 macOS / 解压场景下 +x 检测会失败，
+    但文件仍可执行；必要时尝试补可执行位。
+    """
+    if not path or not os.path.isfile(path):
+        return False
+    if os.name == "nt":
+        return True
+    if os.access(path, os.X_OK):
+        return True
+    try:
+        mode = os.stat(path).st_mode
+        os.chmod(path, mode | 0o111)
+    except OSError:
+        pass
+    return os.access(path, os.X_OK) or os.access(path, os.R_OK)
+
+
 def _which_tools() -> Dict[str, Optional[str]]:
     """定位 ffmpeg/ffprobe: 优先捆绑 bin/, 再 PATH。"""
     names = ("ffmpeg", "ffprobe")
     found: Dict[str, Optional[str]] = {n: None for n in names}
-    candidates = [
-        os.path.join(_resource_dir(), "bin"),
-        os.path.join(_project_dir(), "bin"),
-        os.path.join(_project_dir(), "ffmpeg", "bin"),
-    ]
-    for d in candidates:
+    for d in _tool_bin_dirs():
         for n in names:
             if found[n]:
                 continue
             for exe in (n, f"{n}.exe"):
                 p = os.path.join(d, exe)
-                if os.path.isfile(p) and os.access(p, os.X_OK if os.name != "nt" else os.F_OK):
+                # 解析符号链接，避免 .app 内 Resources→Frameworks 断链误判
+                try:
+                    p = os.path.realpath(p)
+                except OSError:
+                    pass
+                if _is_runnable_binary(p):
                     found[n] = p
+                    break
     for n in names:
         if not found[n]:
             found[n] = shutil.which(n)
