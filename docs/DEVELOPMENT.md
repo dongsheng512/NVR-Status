@@ -137,12 +137,12 @@ uv sync && uv run nvr-gui        # 与 uv run python run_gui.py 等价
 
 | 项 | 说明 |
 |----|------|
-| 通道详情窗 | 每次打开新建顶层窗，多次双击会叠加多个窗口（非模态） |
+| 通道详情窗 | ✅ 已单例复用（B8） |
 | chevron SVG | 每次运行在 `tempfile.gettempdir()` 生成 `nvr_chevron_*.svg`，可写、不清理（可忽略） |
 | 字体告警 | off-screen 下 `Populating font family aliases … "Sans Serif"`，仅测试环境噪音 |
 | off-screen 告警 | `This plugin does not support propagateSizeHints()`，仅测试环境噪音 |
-| 密码明文 | 沿用 v1 设计，`profiles.json` 明文保存账号密码；文档已提示风险 |
-| 窗口最小尺寸 | 未显式限制；小屏 / 高分缩放异常时可能过窄（右面板最小宽度由内容决定） |
+| 密码存储 | ✅ B7 keyring（macOS Keychain / Windows CM）；不可用回退明文；写入失败不丢密 |
+| 窗口最小尺寸 | ✅ `setMinimumSize(1000, 700)`（B8） |
 
 ---
 
@@ -180,7 +180,7 @@ uv sync && uv run nvr-gui        # 与 uv run python run_gui.py 等价
 
 ### 4.4 产品增强（P2+，按需）
 
-- 凭证安全：接入系统 keyring（macOS Keychain / Windows Credential Manager），明文转加密存储。
+- 凭证安全：✅ 已接入系统 keyring（见 B7）；Linux 等平台仍回退明文。
 - 代码签名 / 公证（Mac）、代码签名（Win）：消除 Gatekeeper / SmartScreen 拦截。
 - 多语言（i18n）：目前文案全中文硬编码。
 - 自动更新检查：内网地址 + 版本对比。
@@ -221,3 +221,4 @@ powershell -ExecutionPolicy Bypass -File build\build_win.ps1   # Windows 打包
 | 2026-08 | 创建：PySide6 重写交接文档（摘要 / 现状 / 已知问题 / 优化方向） |
 | 2026-08 | 阶段 A 落地：A1 信号节流、A4 pytest 33 例、A5 主题重绘预警、A6 nvr-gui 可装 + gui_app 标注 legacy、A7 密码风险文档 |
 | 2026-08 | 阶段 B 落地：B1 拆 main_window → ui/panels/；B2 拆 hikvision_status → nvr_core/；B3 scan_runner 共用；B8 最小窗+详情单例；B4 删除 gui_app.py（CTk 遗留）；B5 多设备队列巡检；B6 历史报告归档；B7 凭证 keyring（macOS Keychain / Windows CM），阶段 B 收官 |
+| 2026-08-05 | 除虫收尾：Windows 多设备凭证 TargetName、keyring 写失败不丢密、档案 rename/delete/clone/删设备凭证生命周期、队列失败归档、pyproject 补包、文档同步 B7；pytest 55 例全绿 |

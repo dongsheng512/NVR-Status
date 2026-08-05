@@ -196,21 +196,23 @@ class ConfigStore:
         """返回设备的运行时视图: 密码为空时从 keyring 补全 (不可用则原样)。"""
         from services import credentials
 
-        devices = self.get_profile(name).get("devices") or []
+        profile_name = name or self.get_active_name()
+        devices = self.get_profile(profile_name).get("devices") or []
         if not credentials.available():
             return [deepcopy(d) for d in devices]
         out = []
         for d in devices:
             d = deepcopy(d)
             if not (d.get("password") or ""):
-                d["password"] = credentials.get_password(
-                    self.get_profile(name).get("name", ""), d
-                )
+                d["password"] = credentials.get_password(profile_name, d)
             out.append(d)
         return out
 
     def _migrate_passwords(self, devices: List[Dict[str, Any]], profile_name: str) -> None:
-        """keyring 可用时把非空明文密码移入系统凭证, JSON 内置空。"""
+        """keyring 可用时把非空明文密码移入系统凭证, JSON 内置空。
+
+        仅在 set_password 成功后清空 JSON 中的明文，避免写入失败导致丢密。
+        """
         from services import credentials
 
         if not credentials.available():
@@ -219,18 +221,45 @@ class ConfigStore:
             pw = d.get("password") or ""
             if not pw:
                 continue
-            credentials.set_password(profile_name, d, pw)
-            d["password"] = ""
+            if credentials.set_password(profile_name, d, pw):
+                d["password"] = ""
+
+    def _purge_keyring(self, profile_name: str, devices: List[Dict[str, Any]]) -> None:
+        """删除档案/设备时清理 keyring 条目（尽力而为）。"""
+        from services import credentials
+
+        if not credentials.available():
+            return
+        for d in devices or []:
+            try:
+                credentials.delete_password(profile_name, d)
+            except Exception:
+                pass
 
     def update_profile(self, name: Optional[str], profile: Dict[str, Any]) -> None:
         name = name or self.get_active_name()
         profile = deepcopy(profile)
         profile["name"] = name
+        # 已从档案中移除的设备：清理其 keyring 条目
+        old_devices = (self.data.get("profiles") or {}).get(name, {}).get("devices") or []
+        new_keys = {
+            ((d.get("ip") or "").strip(), (d.get("name") or "").strip())
+            for d in (profile.get("devices") or [])
+        }
+        stale = [
+            d
+            for d in old_devices
+            if ((d.get("ip") or "").strip(), (d.get("name") or "").strip()) not in new_keys
+        ]
+        if stale:
+            self._purge_keyring(name, stale)
         self._migrate_passwords(profile.get("devices") or [], name)
         self.data["profiles"][name] = profile
         self.save()
 
     def create_profile(self, name: str, clone_from: Optional[str] = None) -> str:
+        from services import credentials
+
         name = _safe_profile_name(name)
         base = name
         i = 1
@@ -240,14 +269,26 @@ class ConfigStore:
         if clone_from and clone_from in self.data["profiles"]:
             prof = deepcopy(self.data["profiles"][clone_from])
             prof["name"] = name
+            # 克隆：把源档案 keyring 密码复制到新键（保留源，不 rekey 删除）
+            if credentials.available():
+                for d in prof.get("devices") or []:
+                    # 优先 JSON 明文；否则从源 keyring 读
+                    pw = (d.get("password") or "") or credentials.get_password(
+                        clone_from, d
+                    )
+                    if pw and credentials.set_password(name, d, pw):
+                        d["password"] = ""
         else:
             prof = _default_profile(name)
+        self._migrate_passwords(prof.get("devices") or [], name)
         self.data["profiles"][name] = prof
         self.data["active_profile"] = name
         self.save()
         return name
 
     def rename_profile(self, old: str, new: str) -> bool:
+        from services import credentials
+
         new = _safe_profile_name(new)
         if old not in self.data["profiles"] or not new or new in self.data["profiles"]:
             return False
@@ -255,6 +296,13 @@ class ConfigStore:
         self.data["profiles"][new]["name"] = new
         if self.data.get("active_profile") == old:
             self.data["active_profile"] = new
+        # keyring 账户键含 profile 名，需一并迁移
+        if credentials.available():
+            for d in self.data["profiles"][new].get("devices") or []:
+                try:
+                    credentials.rekey_password(old, new, d)
+                except Exception:
+                    pass
         self.save()
         return True
 
@@ -263,21 +311,24 @@ class ConfigStore:
             return False
         if len(self.data["profiles"]) <= 1:
             return False  # 至少保留一个
-        del self.data["profiles"][name]
+        removed = self.data["profiles"].pop(name)
+        self._purge_keyring(name, removed.get("devices") or [])
         if self.data.get("active_profile") == name:
             self.data["active_profile"] = next(iter(self.data["profiles"]))
         self.save()
         return True
 
     def export_profile(self, name: str, path: str) -> None:
-        prof = self.get_profile(name)
+        # 导出含运行时密码（便于迁移到他机）；导入侧会再迁入 keyring
+        prof = deepcopy(self.get_profile(name))
+        prof["devices"] = self.resolve_devices(name)
         with open(path, "w", encoding="utf-8") as f:
             json.dump(prof, f, ensure_ascii=False, indent=2)
 
     def import_profile(self, path: str, name: Optional[str] = None) -> str:
         with open(path, "r", encoding="utf-8") as f:
             prof = json.load(f)
-        # 兼容旧 nvr_config 单文件
+        # 兼容旧 nvr_config 单文件 / 单档案导出
         if "devices" in prof and "profiles" not in prof:
             pname = _safe_profile_name(name or prof.get("name") or "导入")
             full = _default_profile(pname)
@@ -285,11 +336,17 @@ class ConfigStore:
             full["default"] = int(prof.get("default", 0) or 0)
             if "scan_options" in prof:
                 full["scan_options"].update(prof["scan_options"])
-            return self.create_profile(pname) if pname not in self.data["profiles"] else self._overwrite(pname, full)
+            if pname not in self.data["profiles"]:
+                created = self.create_profile(pname)
+                # create 已写入空默认设备，覆盖为导入内容并迁移密码
+                return self._overwrite(created, full)
+            return self._overwrite(pname, full)
         raise ValueError("无法识别的配置文件格式")
 
     def _overwrite(self, name: str, prof: Dict[str, Any]) -> str:
+        prof = deepcopy(prof)
         prof["name"] = name
+        self._migrate_passwords(prof.get("devices") or [], name)
         self.data["profiles"][name] = prof
         self.data["active_profile"] = name
         self.save()

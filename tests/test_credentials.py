@@ -9,12 +9,16 @@ from services import credentials
 class FakeKeyring:
     """内存版 keyring, 用于在任意平台模拟可用后端。"""
 
-    def __init__(self):
+    def __init__(self, fail_set: bool = False):
         self.store = {}
         self.set_calls = []
+        self.delete_calls = []
+        self.fail_set = fail_set
 
     def set_password(self, profile, device, password):
         self.set_calls.append((profile, device.get("ip"), password))
+        if self.fail_set:
+            return False
         self.store[credentials._account(profile, device)] = password
         return True
 
@@ -22,13 +26,14 @@ class FakeKeyring:
         return self.store.get(credentials._account(profile, device), "")
 
     def delete_password(self, profile, device):
+        self.delete_calls.append((profile, device.get("ip")))
         self.store.pop(credentials._account(profile, device), None)
 
 
-def _profile_with_pw(ip="1.2.3.4", pw="s3cret"):
+def _profile_with_pw(ip="1.2.3.4", pw="s3cret", name="NVR-A"):
     return {
         "name": "默认",
-        "devices": [{"name": "NVR-A", "ip": ip, "username": "admin", "password": pw}],
+        "devices": [{"name": name, "ip": ip, "username": "admin", "password": pw}],
     }
 
 
@@ -41,6 +46,7 @@ def _enable(monkeypatch, kr: FakeKeyring) -> None:
     monkeypatch.setattr(credentials, "set_password", kr.set_password)
     monkeypatch.setattr(credentials, "get_password", kr.get_password)
     monkeypatch.setattr(credentials, "delete_password", kr.delete_password)
+    # rekey_password 保持真实实现，内部调用上面的 get/set/delete mock
 
 
 def test_update_profile_migrates_password_to_keyring(tmp_path, monkeypatch):
@@ -77,6 +83,87 @@ def test_empty_password_not_written(tmp_path, monkeypatch):
     store = _store(tmp_path)
     store.update_profile("默认", _profile_with_pw(pw=""))
     assert kr.set_calls == []
+
+
+def test_migrate_keeps_plaintext_when_keyring_write_fails(tmp_path, monkeypatch):
+    """写入 keyring 失败时不得清空 JSON 明文（防丢密）。"""
+    kr = FakeKeyring(fail_set=True)
+    _enable(monkeypatch, kr)
+    store = _store(tmp_path)
+    store.update_profile("默认", _profile_with_pw())
+    assert store.get_profile("默认")["devices"][0]["password"] == "s3cret"
+    assert kr.store == {}
+
+
+def test_rename_profile_rekeys_passwords(tmp_path, monkeypatch):
+    kr = FakeKeyring()
+    _enable(monkeypatch, kr)
+    store = _store(tmp_path)
+    store.update_profile("默认", _profile_with_pw())
+    assert "默认::1.2.3.4" in kr.store
+    assert store.rename_profile("默认", "机房A")
+    assert "默认::1.2.3.4" not in kr.store
+    assert kr.store["机房A::1.2.3.4"] == "s3cret"
+    assert store.resolve_devices("机房A")[0]["password"] == "s3cret"
+
+
+def test_delete_profile_purges_keyring(tmp_path, monkeypatch):
+    kr = FakeKeyring()
+    _enable(monkeypatch, kr)
+    store = _store(tmp_path)
+    store.update_profile("默认", _profile_with_pw())
+    store.create_profile("备份")
+    assert store.delete_profile("默认")
+    assert "默认::1.2.3.4" not in kr.store
+
+
+def test_clone_profile_copies_keyring_passwords(tmp_path, monkeypatch):
+    kr = FakeKeyring()
+    _enable(monkeypatch, kr)
+    store = _store(tmp_path)
+    store.update_profile("默认", _profile_with_pw())
+    created = store.create_profile("副本", clone_from="默认")
+    assert created == "副本"
+    # 源仍在
+    assert kr.store["默认::1.2.3.4"] == "s3cret"
+    assert kr.store["副本::1.2.3.4"] == "s3cret"
+    assert store.resolve_devices("副本")[0]["password"] == "s3cret"
+
+
+def test_stale_device_keyring_purged_on_update(tmp_path, monkeypatch):
+    kr = FakeKeyring()
+    _enable(monkeypatch, kr)
+    store = _store(tmp_path)
+    store.update_profile(
+        "默认",
+        {
+            "name": "默认",
+            "devices": [
+                {"name": "A", "ip": "1.1.1.1", "username": "admin", "password": "p1"},
+                {"name": "B", "ip": "2.2.2.2", "username": "admin", "password": "p2"},
+            ],
+        },
+    )
+    assert "默认::1.1.1.1" in kr.store and "默认::2.2.2.2" in kr.store
+    store.update_profile(
+        "默认",
+        {
+            "name": "默认",
+            "devices": [
+                {"name": "A", "ip": "1.1.1.1", "username": "admin", "password": ""},
+            ],
+        },
+    )
+    assert "默认::1.1.1.1" in kr.store
+    assert "默认::2.2.2.2" not in kr.store
+
+
+def test_win_target_is_per_device():
+    """Windows TargetName 必须按设备唯一，避免多设备互相覆盖。"""
+    a = credentials._account("p", {"ip": "1.1.1.1"})
+    b = credentials._account("p", {"ip": "2.2.2.2"})
+    assert credentials._win_target(a) != credentials._win_target(b)
+    assert credentials._win_target(a).startswith("NVRStatus/")
 
 
 class _Proc:

@@ -299,6 +299,7 @@ QT_QPA_PLATFORM=offscreen uv run pytest
 | 2026-08-02 | 执行阶段 A：A1/A4/A5/A6/A7 已完成；A2（真机）、A3（打包）待资源就绪 |
 | 2026-08-02 | 执行阶段 B：B1/B2/B3/B4/B5/B6/B7/B8 全部完成，阶段 B 收官 |
 | 2026-08-02 | **进度复核**：对照代码/测试独立验证；见下文 §10 |
+| 2026-08-05 | **除虫/收尾**：Windows keyring 多设备 TargetName、keyring 写入失败不丢密、档案 rename/delete/clone 凭证生命周期、队列失败也归档、pyproject 补 `nvr_core`/`ui.panels`、文档同步 B7 |
 
 ---
 
@@ -351,9 +352,10 @@ QT_QPA_PLATFORM=offscreen uv run pytest
 | **A2 真机回归** | 未完成 | 计划中的发布阻塞项；需实机快/深巡检勾 §5.3 清单 |
 | **A3 打包验收** | 未完成 | 需在目标机跑 build 脚本；记体积/冷启动/ffmpeg |
 | **阶段 C 全部** | 未开工 | 签名、CI、运行日志落盘、QSS 资源化、i18n、更新、ffmpeg 引导 |
-| **文档漂移** | 小 | USAGE §8.1 / README 安全段仍偏「明文 + 计划 keyring」，应改为「优先 keyring，失败回退明文」 |
-| **打包清单** | 小 | `pyproject.toml` `packages` 目前为 `ui, ui.widgets, services`，**未列 `nvr_core` / `ui.panels`**；`uv run`/源码可跑，但 **pip 安装 nvr-gui 可能缺包**。PyInstaller 从 `run_gui.py` 分析依赖一般可带上，建议仍补全 packages |
-| **left_panel 体量** | 观察 | ~848 行，设置/设备表单可再拆（非阻塞） |
+| **文档漂移** | ✅ 已修 | README / USAGE / DEVELOPMENT 已改为「优先 keyring，失败回退明文」 |
+| **打包清单** | ✅ 已修 | `pyproject.toml` packages 含 `nvr_core`、`ui.panels` |
+| **Windows 多设备凭证** | ✅ 已修 | TargetName 改为 `NVRStatus/{account}`，兼容读旧单槽 |
+| **left_panel 体量** | 观察 | ~992 行，设置/设备表单可再拆（非阻塞） |
 
 ### 10.5 建议的下一步（按优先级）
 

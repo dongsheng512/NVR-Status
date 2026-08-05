@@ -36,6 +36,14 @@ def _account(profile: str, device: Dict[str, object]) -> str:
     return f"{profile}::{ip or name}"
 
 
+def _win_target(account: str) -> str:
+    """Windows Credential Manager 的 TargetName：每设备唯一。
+
+    旧实现曾用固定 TargetName=SERVICE，多设备会互相覆盖。
+    """
+    return f"{SERVICE}/{account}"
+
+
 def set_password(profile: str, device: Dict[str, object], password: str) -> bool:
     """写入密码; 返回是否成功。空密码视为删除并返回 False。"""
     if not password:
@@ -70,6 +78,17 @@ def delete_password(profile: str, device: Dict[str, object]) -> None:
         )
     elif sys.platform == "win32":
         _win_delete_password(account)
+
+
+def rekey_password(old_profile: str, new_profile: str, device: Dict[str, object]) -> None:
+    """档案重命名 / 克隆时把凭证迁到新 profile 键。"""
+    if old_profile == new_profile:
+        return
+    pw = get_password(old_profile, device)
+    if not pw:
+        return
+    if set_password(new_profile, device, pw):
+        delete_password(old_profile, device)
 
 
 # ---- macOS: security CLI ----
@@ -131,20 +150,30 @@ class _Credential(ctypes.Structure):
 def _win_set_password(account: str, password: str) -> bool:
     buf = ctypes.create_unicode_buffer(password)
     blob = ctypes.cast(buf, ctypes.c_void_p)
+    target = _win_target(account)
     cred = _Credential(
         Type=CRED_TYPE_GENERIC,
-        TargetName=SERVICE,
+        TargetName=target,
         CredentialBlobSize=(len(password) + 1) * 2,
         CredentialBlob=blob,
         Persist=CRED_PERSIST_LOCAL_MACHINE,
         UserName=account,
     )
-    return bool(ctypes.windll.advapi32.CredWriteW(ctypes.byref(cred), 0))
+    ok = bool(ctypes.windll.advapi32.CredWriteW(ctypes.byref(cred), 0))
+    if ok:
+        # 清理旧版单槽 TargetName=SERVICE 残留，避免读到过期密码
+        try:
+            ctypes.windll.advapi32.CredDeleteW(SERVICE, CRED_TYPE_GENERIC, 0)
+        except Exception:
+            pass
+    return ok
 
 
-def _win_get_password(account: str) -> str:
+def _win_read_blob(target: str) -> str:
     pcred = ctypes.POINTER(_Credential)()
-    if not ctypes.windll.advapi32.CredReadW(SERVICE, CRED_TYPE_GENERIC, 0, ctypes.byref(pcred)):
+    if not ctypes.windll.advapi32.CredReadW(
+        target, CRED_TYPE_GENERIC, 0, ctypes.byref(pcred)
+    ):
         return ""
     try:
         size = pcred.contents.CredentialBlobSize
@@ -154,5 +183,37 @@ def _win_get_password(account: str) -> str:
         ctypes.windll.advapi32.CredFree(pcred)
 
 
+def _win_get_password(account: str) -> str:
+    # 优先 per-device TargetName
+    pw = _win_read_blob(_win_target(account))
+    if pw:
+        return pw
+    # 兼容旧版：唯一 TargetName=SERVICE，UserName=account
+    pcred = ctypes.POINTER(_Credential)()
+    if not ctypes.windll.advapi32.CredReadW(
+        SERVICE, CRED_TYPE_GENERIC, 0, ctypes.byref(pcred)
+    ):
+        return ""
+    try:
+        user = pcred.contents.UserName or ""
+        if user != account:
+            return ""
+        size = pcred.contents.CredentialBlobSize
+        data = ctypes.string_at(pcred.contents.CredentialBlob, size)
+        return data.decode("utf-16-le").rstrip("\x00")
+    finally:
+        ctypes.windll.advapi32.CredFree(pcred)
+
+
 def _win_delete_password(account: str) -> None:
-    ctypes.windll.advapi32.CredDeleteW(SERVICE, CRED_TYPE_GENERIC, 0)
+    ctypes.windll.advapi32.CredDeleteW(_win_target(account), CRED_TYPE_GENERIC, 0)
+    # 若旧版槽位正好是本 account，一并删掉
+    pcred = ctypes.POINTER(_Credential)()
+    if ctypes.windll.advapi32.CredReadW(
+        SERVICE, CRED_TYPE_GENERIC, 0, ctypes.byref(pcred)
+    ):
+        try:
+            if (pcred.contents.UserName or "") == account:
+                ctypes.windll.advapi32.CredDeleteW(SERVICE, CRED_TYPE_GENERIC, 0)
+        finally:
+            ctypes.windll.advapi32.CredFree(pcred)

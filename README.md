@@ -123,11 +123,12 @@ cam-gui/
 
 - **不要**将含真实密码的 `nvr_config.json` 提交到 Git（已在 `.gitignore` 中忽略）。  
 - GUI 档案保存在本机用户目录，不在安装包内写死密码。  
-- **明文凭证提醒**：当前版本 NVR 账号密码以明文保存在 `profiles.json`
-  （macOS `~/Library/Application Support/NVRStatus/`，Windows `%APPDATA%\NVRStatus\`）。
-  - 请勿将该目录或文件拷贝、共享或上传到不受控环境；
-  - 多用户机器上建议为系统账号设置登录密码并保持目录仅本人可读写；
-  - 后续版本计划改用系统 keyring（Keychain / 凭据管理器）加密存储。
+- **凭证存储（B7）**：macOS / Windows 优先把 NVR 密码写入系统 keyring
+  （Keychain / Credential Manager），`profiles.json` 中密码字段为空；
+  其它平台或 keyring 不可用时回退为 JSON 明文。
+  - 请勿把 `profiles.json`、导出的配置 JSON（导出可能含明文密码）或用户数据目录
+    拷贝、共享或上传到不受控环境；
+  - 多用户机器上建议为系统账号设置登录密码并保持目录仅本人可读写。
 - 内网工具：请仅在可信网络环境使用。
 
 ---

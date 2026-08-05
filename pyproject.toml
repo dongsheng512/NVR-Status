@@ -10,7 +10,7 @@ py-modules = [
     "main",
     "run_gui",
 ]
-packages = ["ui", "ui.widgets", "services"]
+packages = ["ui", "ui.panels", "ui.widgets", "services", "nvr_core"]
 
 [project]
 name = "cam"

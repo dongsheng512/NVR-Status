@@ -309,18 +309,21 @@ uv run hikvision_status.py \
 - 工作日白天做人流较多时段的深度抽检（默认已优先 10:00–18:00）
 - 全量 64 路抽检大约数分钟～十几分钟，错峰或先用 `--av-limit` 抽样
 
-### 8.1 凭证安全（A7）
+### 8.1 凭证安全（A7 / B7）
 
-- GUI 档案中的 NVR 密码以**明文**存于 `profiles.json`（用户目录，见下表）。
-- 请勿把 `profiles.json` / `nvr_config.json` 提交、共享或上传到不受控环境。
+- **macOS / Windows**：密码优先写入系统 keyring（Keychain / Credential Manager），
+  `profiles.json` 中对应字段为空；读取档案时自动补全到运行时。
+- **其它平台或 keyring 不可用**：回退为 JSON **明文**保存（与 v1 行为一致）。
+- 请勿把 `profiles.json` / `nvr_config.json` / **导出的配置 JSON**（导出为便于迁移
+  可能含明文密码）提交、共享或上传到不受控环境。
 - 多用户机器：为系统账号设置登录密码，并收紧目录权限（macOS 保持
   `~/Library/Application Support/NVRStatus/` 仅本人可读写）。
-- 计划后续改用系统 keyring（macOS Keychain / Windows 凭据管理器）加密存储。
 
-| 平台 | profiles.json 路径 |
-|------|--------------------|
-| macOS | `~/Library/Application Support/NVRStatus/profiles.json` |
-| Windows | `%APPDATA%\NVRStatus\profiles.json` |
+| 平台 | profiles.json 路径 | 密码存储 |
+|------|--------------------|----------|
+| macOS | `~/Library/Application Support/NVRStatus/profiles.json` | Keychain（优先） |
+| Windows | `%APPDATA%\NVRStatus\profiles.json` | Credential Manager（优先） |
+| 其它 | `~/.config/NVRStatus/profiles.json` | JSON 明文 |
 
 ---
 

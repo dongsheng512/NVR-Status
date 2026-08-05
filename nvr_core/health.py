@@ -45,12 +45,18 @@ class HealthMixin:
         ow_enabled = overwrite.get("enabled")  # True / False / None
         ow_label = overwrite.get("label") or "未知"
 
-        bad_drives = [d for d in drives if d["状态"] not in ("ok", "sleep", "idle")]
+        bad_drives = [
+            d for d in drives if d.get("状态") not in ("ok", "sleep", "idle")
+        ]
         if bad_drives:
             raise_to("严重")
             health["预警信息"].append(f"{len(bad_drives)}块硬盘状态异常")
 
-        full_drives = [d for d in drives if _to_float(d["使用率"].replace("%", "")) > 95]
+        full_drives = [
+            d
+            for d in drives
+            if _to_float(str(d.get("使用率") or "0").replace("%", "")) > 95
+        ]
         if full_drives:
             n_full = len(full_drives)
             if ow_enabled is False:
@@ -77,7 +83,9 @@ class HealthMixin:
                     f"循环覆盖{ow_label}：硬盘写满后将停止录像，建议在 NVR 存储设置中开启"
                 )
 
-        sleeping_drives = [d for d in drives if d["状态"] in ["sleep", "idle"]]
+        sleeping_drives = [
+            d for d in drives if d.get("状态") in ("sleep", "idle")
+        ]
         if sleeping_drives:
             health["预警信息"].append(f"{len(sleeping_drives)}块硬盘处于休眠状态")
 

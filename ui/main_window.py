@@ -74,7 +74,7 @@ class MainWindow(QMainWindow):
 
         self.store = ConfigStore()
         self.settings = QSettings("NVRStatus", "NVRStatus")
-        self.worker: Optional[ScanWorker] = None
+        self.worker: Optional[ScanWorker | QueueScanWorker] = None
         self._theme_mode = self._load_theme_mode()
 
         self._build_ui()
@@ -515,13 +515,14 @@ class MainWindow(QMainWindow):
         worker.start()
 
     def _on_queue_device_finished(self, report: Dict[str, Any]) -> None:
+        # 失败结果同样归档，便于历史回溯
+        self._save_history(report)
         if report.get("error"):
             self.log_panel.log(
                 f"{report.get('device_name')}: {report['error']}", level="error"
             )
             return
         self.results_panel.render_result(report)
-        self._save_history(report)
 
     def _on_queue_finished(self, results: List[Dict[str, Any]]) -> None:
         self.status_bar.set_progress(1.0, current=None, total=None)

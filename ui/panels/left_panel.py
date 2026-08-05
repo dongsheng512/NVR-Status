@@ -969,15 +969,16 @@ class LeftPanel(QWidget):
         self._open_path(app_data_dir())
 
     def _open_path(self, path: str) -> None:
+        import subprocess
         import sys
 
         try:
             if sys.platform == "darwin":
-                os.system(f'open "{path}"')
+                subprocess.run(["open", path], check=False)
             elif sys.platform == "win32":
                 os.startfile(path)  # type: ignore[attr-defined]
             else:
-                os.system(f'xdg-open "{path}"')
+                subprocess.run(["xdg-open", path], check=False)
         except Exception as e:
             QMessageBox.critical(self, "打开失败", str(e))
 
