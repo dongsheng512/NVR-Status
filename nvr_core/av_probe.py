@@ -20,6 +20,129 @@ from nvr_core.util import _safe_filename
 
 
 class AVProbeMixin:
+    # RTSP 时间串: 海康 playbackURI 里 Z 后缀在不同固件上既可能表示
+    # 真 UTC, 也可能表示设备本地墙钟(数字是本地时,后缀仍写 Z)。
+    # 写侧默认用本地墙钟(_fmt_rtsp_time); 读侧需与 CMSearch 段时间对齐判定。
+
+    def _inject_rtsp_auth(self, uri: str) -> str:
+        """向 rtsp:// 注入 user:pass@；已有 userinfo 则替换。"""
+        if not uri or not uri.startswith("rtsp://"):
+            return uri
+        rest = uri[len("rtsp://") :]
+        slash = rest.find("/")
+        authority = rest if slash < 0 else rest[:slash]
+        path = "" if slash < 0 else rest[slash:]
+        if "@" in authority:
+            authority = authority.rsplit("@", 1)[-1]
+        user = quote(self.username, safe="")
+        pwd = quote(self.password, safe="")
+        return f"rtsp://{user}:{pwd}@{authority}{path}"
+
+    def _fmt_rtsp_time_mode(self, dt: datetime, mode: str) -> str:
+        """按约定格式化 RTSP starttime/endtime。
+
+        mode='local': 设备本地墙钟 + Z（常见国行 NVR，OSD 与墙钟一致）
+        mode='utc': 真 UTC + Z（部分固件 / 文档字面含义）
+        """
+        if mode == "utc":
+            return dt.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        return self._fmt_rtsp_time(dt)
+
+    def _parse_rtsp_uri_time(self, text: str, mode: str) -> datetime:
+        """解析 URI 内 YYYYMMDDTHHMMSSZ → UTC aware。"""
+        naive = datetime.strptime(text, "%Y%m%dT%H%M%SZ")
+        if mode == "utc":
+            return naive.replace(tzinfo=timezone.utc)
+        return naive.replace(tzinfo=self._get_device_tz()).astimezone(timezone.utc)
+
+    def _detect_rtsp_time_mode(
+        self,
+        uri_start_raw: str,
+        seg_start: Optional[datetime],
+    ) -> str:
+        """根据 CMSearch 段起点与 URI 数字的匹配程度判定 local / utc。
+
+        无对照信息时默认 local（与写侧 _fmt_rtsp_time 一致，国行最常见）。
+        """
+        if not uri_start_raw or seg_start is None:
+            return "local"
+        try:
+            as_utc = self._parse_rtsp_uri_time(uri_start_raw, "utc")
+            as_local = self._parse_rtsp_uri_time(uri_start_raw, "local")
+        except ValueError:
+            return "local"
+        seg = seg_start if seg_start.tzinfo else seg_start.replace(tzinfo=timezone.utc)
+        d_utc = abs((as_utc - seg).total_seconds())
+        d_local = abs((as_local - seg).total_seconds())
+        if d_utc + 2 < d_local:
+            return "utc"
+        return "local"
+
+    def _compute_clip_window(
+        self,
+        uri_s: datetime,
+        uri_e: datetime,
+        seconds: int,
+        clip_start: Optional[datetime] = None,
+        clip_end: Optional[datetime] = None,
+    ) -> Tuple[datetime, datetime]:
+        """在录像段 [uri_s, uri_e] 内切出短抽检窗（UTC）。"""
+        now = datetime.now(timezone.utc)
+        sec = max(1, int(seconds))
+        if clip_start is not None and clip_end is not None:
+            cs = clip_start if clip_start.tzinfo else clip_start.replace(tzinfo=timezone.utc)
+            ce = clip_end if clip_end.tzinfo else clip_end.replace(tzinfo=timezone.utc)
+            clip_s = max(uri_s, cs)
+            clip_e = min(uri_e, ce)
+            if clip_e <= clip_s:
+                clip_s = uri_s
+                clip_e = min(uri_e, uri_s + timedelta(seconds=sec))
+            if (clip_e - clip_s).total_seconds() < max(1, sec // 2):
+                clip_e = min(uri_e, clip_s + timedelta(seconds=sec))
+        else:
+            clip_e = min(now - timedelta(seconds=3), uri_e - timedelta(seconds=2))
+            if clip_e <= uri_s:
+                clip_e = uri_e
+            clip_s = clip_e - timedelta(seconds=sec)
+            if clip_s < uri_s:
+                clip_s = uri_s
+            if clip_e <= clip_s:
+                clip_e = min(uri_e, clip_s + timedelta(seconds=sec))
+
+        if clip_e <= clip_s:
+            clip_s = uri_s
+            clip_e = min(uri_e, uri_s + timedelta(seconds=sec))
+        if clip_e <= clip_s:
+            clip_e = clip_s + timedelta(seconds=sec)
+        return clip_s, clip_e
+
+    def _rewrite_rtsp_times(
+        self,
+        playback_uri: str,
+        clip_s: datetime,
+        clip_e: datetime,
+        mode: str,
+    ) -> str:
+        """改写 starttime/endtime，去掉 size，保留其余查询参数。"""
+        short = playback_uri
+        short = re.sub(
+            r"starttime=\d{8}T\d{6}Z",
+            f"starttime={self._fmt_rtsp_time_mode(clip_s, mode)}",
+            short,
+            flags=re.I,
+        )
+        short = re.sub(
+            r"endtime=\d{8}T\d{6}Z",
+            f"endtime={self._fmt_rtsp_time_mode(clip_e, mode)}",
+            short,
+            flags=re.I,
+        )
+        short = re.sub(r"[&?]size=\d+", "", short, flags=re.I)
+        short = re.sub(r"\?&", "?", short)
+        short = re.sub(r"&&+", "&", short)
+        short = short.rstrip("?&")
+        return short
+
     def _build_short_rtsp(
         self,
         playback_uri: str,
@@ -29,79 +152,101 @@ class AVProbeMixin:
         clip_start: Optional[datetime] = None,
         clip_end: Optional[datetime] = None,
     ) -> Optional[str]:
-        """从完整 playbackURI 截取短窗口,并注入鉴权。绝不整段下载。
+        """构造首选短时 RTSP（兼容旧调用）；完整候选见 _build_short_rtsp_candidates。"""
+        cands = self._build_short_rtsp_candidates(
+            playback_uri,
+            seg_start,
+            seg_end,
+            seconds,
+            clip_start=clip_start,
+            clip_end=clip_end,
+        )
+        return cands[0][1] if cands else None
 
-        若传入 clip_start/clip_end(UTC),优先使用(用于繁忙时段定点抽检);
-        否则回退为片段末尾附近短窗。
+    def _build_short_rtsp_candidates(
+        self,
+        playback_uri: str,
+        seg_start: Optional[datetime],
+        seg_end: Optional[datetime],
+        seconds: int,
+        clip_start: Optional[datetime] = None,
+        clip_end: Optional[datetime] = None,
+    ) -> List[Tuple[str, str]]:
+        """生成短时 RTSP 候选列表 [(标签, url), ...]。
+
+        顺序：
+          1. 改写短窗 + 自动检测的时间模式（local/utc）
+          2. 改写短窗 + 另一模式（应对固件差异 / 400）
+          3. 原 URI 仅注入鉴权，靠 ffmpeg -t 截断（最保守回退）
+
+        根因：旧实现把 URI 内 starttime 一律当 UTC 解析，却用本地墙钟写回，
+        东八区会偏移 8 小时 → 设备 400 Bad Request。
         """
         if not playback_uri or not playback_uri.startswith("rtsp://"):
-            return None
+            return []
+
         now = datetime.now(timezone.utc)
         m = re.search(
             r"starttime=(\d{8}T\d{6}Z).*endtime=(\d{8}T\d{6}Z)",
             playback_uri,
             re.I,
         )
+        mode = "local"
+        uri_s: Optional[datetime] = None
+        uri_e: Optional[datetime] = None
+
         if m:
+            mode = self._detect_rtsp_time_mode(m.group(1), seg_start)
             try:
-                uri_s = datetime.strptime(m.group(1), "%Y%m%dT%H%M%SZ").replace(tzinfo=timezone.utc)
-                uri_e = datetime.strptime(m.group(2), "%Y%m%dT%H%M%SZ").replace(tzinfo=timezone.utc)
+                uri_s = self._parse_rtsp_uri_time(m.group(1), mode)
+                uri_e = self._parse_rtsp_uri_time(m.group(2), mode)
             except ValueError:
-                uri_s, uri_e = seg_start, seg_end
-        else:
-            uri_s, uri_e = seg_start, seg_end
+                uri_s = uri_e = None
+
+        def _aware(dt: Optional[datetime]) -> Optional[datetime]:
+            if dt is None:
+                return None
+            return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+        # 段边界优先 CMSearch
+        if seg_start is not None:
+            uri_s = _aware(seg_start)
+        elif uri_s is not None:
+            uri_s = _aware(uri_s)
+        if seg_end is not None:
+            uri_e = _aware(seg_end)
+        elif uri_e is not None:
+            uri_e = _aware(uri_e)
 
         if uri_e is None:
             uri_e = now
         if uri_s is None:
             uri_s = uri_e - timedelta(minutes=5)
+        uri_s = _aware(uri_s)  # type: ignore[assignment]
+        uri_e = _aware(uri_e)  # type: ignore[assignment]
+        if uri_e <= uri_s:
+            uri_e = uri_s + timedelta(seconds=max(1, int(seconds)))
 
-        if clip_start is not None and clip_end is not None:
-            clip_s = max(uri_s, clip_start)
-            clip_e = min(uri_e, clip_end)
-            if clip_e <= clip_s:
-                # 指定点不在该段内,夹到段内可用区域
-                clip_e = min(uri_e, uri_s + timedelta(seconds=seconds))
-                clip_s = uri_s
-            # 保证至少接近请求时长
-            if (clip_e - clip_s).total_seconds() < max(2, seconds // 2):
-                clip_e = min(uri_e, clip_s + timedelta(seconds=seconds))
-        else:
-            # 取片段末尾附近短窗,避开正在写入的最前沿几秒
-            clip_e = min(now - timedelta(seconds=3), uri_e - timedelta(seconds=2))
-            if clip_e <= uri_s:
-                clip_e = uri_e
-            clip_s = clip_e - timedelta(seconds=seconds)
-            if clip_s < uri_s:
-                clip_s = uri_s
-            if clip_e <= clip_s:
-                clip_e = min(uri_e, clip_s + timedelta(seconds=seconds))
+        clip_s, clip_e = self._compute_clip_window(
+            uri_s, uri_e, seconds, clip_start=clip_start, clip_end=clip_end
+        )
 
-        short = playback_uri
+        out: List[Tuple[str, str]] = []
+        seen: set = set()
+
+        def _add(label: str, url: str) -> None:
+            if url and url not in seen:
+                seen.add(url)
+                out.append((label, url))
+
         if m:
-            # 必须用设备本地墙钟写入,不能用 UTC(否则 OSD 会显示成早上 5 点多)
-            short = re.sub(
-                r"starttime=\d{8}T\d{6}Z",
-                f"starttime={self._fmt_rtsp_time(clip_s)}",
-                short,
-                flags=re.I,
-            )
-            short = re.sub(
-                r"endtime=\d{8}T\d{6}Z",
-                f"endtime={self._fmt_rtsp_time(clip_e)}",
-                short,
-                flags=re.I,
-            )
-        # 去掉 size,避免设备按完整段长度处理
-        short = re.sub(r"[&?]size=\d+", "", short)
-        short = short.replace("?&", "?").rstrip("?&")
-
-        # rtsp://host/path -> rtsp://user:pass@host/path (密码 URL 编码)
-        host_path = short[len("rtsp://"):]
-        user = quote(self.username, safe="")
-        pwd = quote(self.password, safe="")
-        return f"rtsp://{user}:{pwd}@{host_path}"
-
+            primary = mode
+            alt = "utc" if primary == "local" else "local"
+            for md in (primary, alt):
+                rewritten = self._rewrite_rtsp_times(playback_uri, clip_s, clip_e, md)
+                _add(f"short/{md}", self._inject_rtsp_auth(rewritten))
+        _add("original", self._inject_rtsp_auth(playback_uri))
+        return out
     def _prepare_av_save_dir(self) -> Optional[str]:
         """创建本次抽检的保存目录: <项目>/av_samples/<YYYYMMDD_HHMMSS>/"""
         if not self.av_save:
@@ -207,7 +352,7 @@ class AVProbeMixin:
             result["抽检详情"] = "无回放URI"
             return result
 
-        rtsp = self._build_short_rtsp(
+        candidates = self._build_short_rtsp_candidates(
             playback_uri,
             seg_start,
             seg_end,
@@ -215,7 +360,7 @@ class AVProbeMixin:
             clip_start=clip_start,
             clip_end=clip_end,
         )
-        if not rtsp:
+        if not candidates:
             result["抽检详情"] = "无法构造短时RTSP地址"
             return result
 
@@ -223,31 +368,66 @@ class AVProbeMixin:
         try:
             fd, tmp_path = tempfile.mkstemp(prefix=f"nvr_av_{track_id}_", suffix=".mkv")
             os.close(fd)
-            # 低干扰: TCP RTSP、严格短时长、stream copy(本地不重编码)
-            cmd = [
-                ffmpeg, "-y",
-                "-hide_banner", "-loglevel", "error",
-                "-rtsp_transport", "tcp",
-                "-i", rtsp,
-                "-t", str(self.av_seconds),
-                "-map", "0",
-                "-c", "copy",
-                "-f", "matroska",
-                tmp_path,
-            ]
-            timeout = self.av_seconds + 45
-            proc = subprocess.run(
-                cmd, capture_output=True, text=True, timeout=timeout
-            )
-            size = os.path.getsize(tmp_path) if os.path.exists(tmp_path) else 0
-            if proc.returncode != 0 or size < 1024:
-                err = (proc.stderr or "").strip().splitlines()
-                err_s = err[-1] if err else f"rc={proc.returncode}"
+            last_err = ""
+            size = 0
+            # 多候选重试。短窗 seek 在部分通道会卡住，必须捕获 TimeoutExpired 继续下一候选。
+            for label, rtsp in candidates:
+                if os.path.exists(tmp_path):
+                    try:
+                        os.truncate(tmp_path, 0)
+                    except OSError:
+                        pass
+                if label == "original":
+                    timeout = self.av_seconds + 45
+                    sock_us = 20_000_000
+                else:
+                    timeout = self.av_seconds + 20
+                    sock_us = 12_000_000
+                cmd = [
+                    ffmpeg, "-y",
+                    "-hide_banner", "-loglevel", "error",
+                    "-rtsp_transport", "tcp",
+                    "-timeout", str(sock_us),
+                    "-i", rtsp,
+                    "-t", str(self.av_seconds),
+                    "-map", "0",
+                    "-c", "copy",
+                    "-f", "matroska",
+                    tmp_path,
+                ]
+                try:
+                    proc = subprocess.run(
+                        cmd, capture_output=True, text=True, timeout=timeout
+                    )
+                except subprocess.TimeoutExpired:
+                    last_err = f"拉流超时({label},{timeout}s)"
+                    continue
+                size = os.path.getsize(tmp_path) if os.path.exists(tmp_path) else 0
+                if proc.returncode == 0 and size >= 1024:
+                    break
+                err_lines = (proc.stderr or "").strip().splitlines()
+                last_err = err_lines[-1] if err_lines else f"rc={proc.returncode}"
+            else:
                 result["视频抽检"] = "异常"
                 result["音频抽检"] = "异常"
-                result["抽检详情"] = f"短时拉流失败({err_s[:120]})"
+                hint = ""
+                low = last_err.lower()
+                if "超时" in last_err or "timeout" in low:
+                    hint = (
+                        "；短窗 seek 可能卡住，已回退原URI仍失败。"
+                        "请检查该通道回放/码流是否异常"
+                    )
+                elif "400" in low or "bad request" in low:
+                    hint = (
+                        "；多为回放时间窗无效(时区/段外)。"
+                        "已尝试 local/utc 改写与原URI回退"
+                    )
+                elif "401" in low or "unauthor" in low:
+                    hint = "；鉴权失败，请核对账号密码"
+                elif "404" in low:
+                    hint = "；回放资源不存在，通道可能无该时段录像"
+                result["抽检详情"] = f"短时拉流失败({last_err[:100]}){hint}"
                 return result
-
             probe_cmd = [
                 ffprobe, "-v", "error",
                 "-show_streams",
