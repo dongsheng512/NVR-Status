@@ -364,25 +364,35 @@ class AVProbeMixin:
             result["抽检详情"] = "无法构造短时RTSP地址"
             return result
 
+        # 优先原 URI：球机短窗 seek 慢且易超时；原段 + 仅视频轨通常数秒成功
+        ordered = sorted(
+            candidates,
+            key=lambda x: (0 if x[0] == "original" else 1, x[0]),
+        )
+
         tmp_path = None
         try:
             fd, tmp_path = tempfile.mkstemp(prefix=f"nvr_av_{track_id}_", suffix=".mkv")
             os.close(fd)
             last_err = ""
             size = 0
-            # 多候选重试。短窗 seek 在部分通道会卡住，必须捕获 TimeoutExpired 继续下一候选。
-            for label, rtsp in candidates:
+            # 仅映射视频轨：部分球机全流 demux（含 AAC 等音轨）会挂死，
+            # 真机青少前台-2/托雅前台-2：-map 0 超时，-map 0:v:0 约 5s 成功。
+            # 这与 AAC 编码本身无关，是回放多轨转发问题；现场有图有声仍会误报。
+            min_ok = 8 * 1024
+            partial_ok = 24 * 1024
+            for label, rtsp in ordered:
                 if os.path.exists(tmp_path):
                     try:
                         os.truncate(tmp_path, 0)
                     except OSError:
                         pass
                 if label == "original":
-                    timeout = self.av_seconds + 45
-                    sock_us = 20_000_000
-                else:
-                    timeout = self.av_seconds + 20
+                    timeout = self.av_seconds + 25
                     sock_us = 12_000_000
+                else:
+                    timeout = self.av_seconds + 30
+                    sock_us = 10_000_000
                 cmd = [
                     ffmpeg, "-y",
                     "-hide_banner", "-loglevel", "error",
@@ -390,7 +400,7 @@ class AVProbeMixin:
                     "-timeout", str(sock_us),
                     "-i", rtsp,
                     "-t", str(self.av_seconds),
-                    "-map", "0",
+                    "-map", "0:v:0",
                     "-c", "copy",
                     "-f", "matroska",
                     tmp_path,
@@ -399,23 +409,28 @@ class AVProbeMixin:
                     proc = subprocess.run(
                         cmd, capture_output=True, text=True, timeout=timeout
                     )
+                    size = os.path.getsize(tmp_path) if os.path.exists(tmp_path) else 0
+                    if size >= min_ok and (
+                        proc.returncode == 0 or size >= partial_ok
+                    ):
+                        break
+                    err_lines = (proc.stderr or "").strip().splitlines()
+                    last_err = err_lines[-1] if err_lines else f"rc={proc.returncode}"
                 except subprocess.TimeoutExpired:
+                    size = os.path.getsize(tmp_path) if os.path.exists(tmp_path) else 0
+                    if size >= partial_ok:
+                        break
                     last_err = f"拉流超时({label},{timeout}s)"
                     continue
-                size = os.path.getsize(tmp_path) if os.path.exists(tmp_path) else 0
-                if proc.returncode == 0 and size >= 1024:
-                    break
-                err_lines = (proc.stderr or "").strip().splitlines()
-                last_err = err_lines[-1] if err_lines else f"rc={proc.returncode}"
             else:
                 result["视频抽检"] = "异常"
-                result["音频抽检"] = "异常"
+                result["音频抽检"] = "跳过"
                 hint = ""
                 low = last_err.lower()
                 if "超时" in last_err or "timeout" in low:
                     hint = (
-                        "；短窗 seek 可能卡住，已回退原URI仍失败。"
-                        "请检查该通道回放/码流是否异常"
+                        "；回放视频轨超时(已试原URI/local/utc)。"
+                        "请检查该通道回放服务"
                     )
                 elif "400" in low or "bad request" in low:
                     hint = (
@@ -438,13 +453,14 @@ class AVProbeMixin:
             p2 = subprocess.run(probe_cmd, capture_output=True, text=True, timeout=30)
             if p2.returncode != 0:
                 result["视频抽检"] = "异常"
-                result["音频抽检"] = "未知"
+                result["音频抽检"] = "跳过"
                 result["抽检详情"] = "ffprobe解析失败"
                 return result
 
             data = json.loads(p2.stdout or "{}")
             streams = data.get("streams") or []
             vstreams = [s for s in streams if s.get("codec_type") == "video"]
+            # 策略上只拉视频轨，文件内通常无音频；不以「无音频轨」判异常
             astreams = [s for s in streams if s.get("codec_type") == "audio"]
 
             if vstreams:
@@ -465,7 +481,6 @@ class AVProbeMixin:
                 as_ = astreams[0]
                 result["audio_codec"] = as_.get("codec_name")
                 result["音频抽检"] = "正常"
-                # 粗测静音:仅当期望有音频时
                 if expect_audio is not False:
                     vol_cmd = [
                         ffmpeg, "-hide_banner", "-nostats",
@@ -492,24 +507,10 @@ class AVProbeMixin:
                                 else extra
                             )
             else:
-                if expect_audio is True:
-                    result["音频抽检"] = "异常"
-                    extra = "配置含音频但文件无音频轨"
-                    result["抽检详情"] = (
-                        f"{result['抽检详情']}; {extra}" if result["抽检详情"]
-                        else extra
-                    )
-                elif expect_audio is False:
-                    result["音频抽检"] = "跳过"
-                else:
-                    result["音频抽检"] = "警告"
-                    extra = "无音频轨"
-                    result["抽检详情"] = (
-                        f"{result['抽检详情']}; {extra}" if result["抽检详情"]
-                        else extra
-                    )
+                # 仅视频策略：音频不二次拉流（易超时误报），配置有音频也标跳过
+                result["音频抽检"] = "跳过"
 
-            if result["视频抽检"] == "正常" and result["音频抽检"] in ("正常", "跳过"):
+            if result["视频抽检"] == "正常":
                 parts = []
                 if result.get("resolution"):
                     parts.append(result["resolution"])
@@ -522,11 +523,10 @@ class AVProbeMixin:
                 if not result["抽检详情"]:
                     prefix = "短时抽检OK"
                     if sample_label:
-                        # 只保留抽检点时间,避免详情过长
                         m = re.search(r"抽检点\s+([0-9\- :]+)", sample_label)
                         if m:
                             prefix = f"短时抽检OK@{m.group(1).strip()}"
-                    result["抽检详情"] = prefix + " " + " ".join(parts)
+                    result["抽检详情"] = (prefix + " " + " ".join(parts)).strip()
 
             # 成功拉到有效片段后,可选保存到项目目录
             if self.av_save and size >= 1024:
