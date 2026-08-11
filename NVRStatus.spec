@@ -25,10 +25,18 @@ bundle_ffmpeg = not (_lite or _no_ff)
 bins = []
 bin_dir = os.path.join(root, 'bin')
 if bundle_ffmpeg and os.path.isdir(bin_dir):
-    for name in os.listdir(bin_dir):
-        p = os.path.join(bin_dir, name)
-        if os.path.isfile(p) and not name.endswith('.md'):
-            bins.append((p, 'bin'))
+    # 递归收集 bin/ 下可执行文件与 dylibbundler 产出的 libs/
+    # （Homebrew ffmpeg 动态链接，需一并打包 libs 才可离线运行）
+    for dirpath, _dirnames, filenames in os.walk(bin_dir):
+        for name in filenames:
+            if name.endswith('.md'):
+                continue
+            p = os.path.join(dirpath, name)
+            if not os.path.isfile(p):
+                continue
+            rel_dir = os.path.relpath(dirpath, bin_dir)
+            dest = 'bin' if rel_dir in ('.', '') else os.path.join('bin', rel_dir)
+            bins.append((p, dest))
 
 # 应用图标
 icon_icns = os.path.join(root, 'assets', 'AppIcon.icns')

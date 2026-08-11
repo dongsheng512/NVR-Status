@@ -38,12 +38,36 @@ if [[ "${NVR_LITE:-}" != "1" && "${NVR_BUNDLE_FFMPEG:-1}" != "0" ]]; then
   if [[ ! -f bin/ffmpeg ]] && command -v ffmpeg >/dev/null; then
     mkdir -p bin
     echo "==> 复制 ffmpeg/ffprobe 到 bin/"
-    cp "$(command -v ffmpeg)" bin/ffmpeg
-    cp "$(command -v ffprobe)" bin/ffprobe
+    # 优先 Cellar 真实二进制（PATH 里常为同样路径）
+    src_ff="$(command -v ffmpeg)"
+    src_fp="$(command -v ffprobe)"
+    if command -v brew >/dev/null 2>&1; then
+      pref="$(brew --prefix ffmpeg 2>/dev/null || true)"
+      if [[ -n "$pref" && -x "$pref/bin/ffmpeg" ]]; then
+        src_ff="$pref/bin/ffmpeg"
+        src_fp="$pref/bin/ffprobe"
+      fi
+    fi
+    cp "$src_ff" bin/ffmpeg
+    cp "$src_fp" bin/ffprobe
     chmod +x bin/ffmpeg bin/ffprobe
   fi
+  # Homebrew 动态链接：用 dylibbundler 把依赖打进 bin/libs，保证可分发
+  if [[ -f bin/ffmpeg ]] && command -v dylibbundler >/dev/null 2>&1; then
+    if otool -L bin/ffmpeg 2>/dev/null | grep -qE 'homebrew|@rpath/libav'; then
+      echo "==> dylibbundler: 将 ffmpeg 动态库打入 bin/libs/"
+      /bin/rm -rf bin/libs
+      mkdir -p bin/libs
+      dylibbundler -od -b -x bin/ffmpeg -d bin/libs -p @executable_path/libs/
+      dylibbundler -od -b -x bin/ffprobe -d bin/libs -p @executable_path/libs/
+    fi
+  elif [[ -f bin/ffmpeg ]] && otool -L bin/ffmpeg 2>/dev/null | grep -q homebrew; then
+    echo "==> 警告: bin/ffmpeg 依赖 Homebrew 动态库，但未安装 dylibbundler"
+    echo "    完整包在无 Homebrew 的机器上深度抽检可能失败。建议: brew install dylibbundler"
+  fi
   if [[ -f bin/ffmpeg ]]; then
-    echo "==> 将捆绑 ffmpeg: $(du -h bin/ffmpeg bin/ffprobe 2>/dev/null | awk '{print $1,$2}')"
+    echo "==> 将捆绑 ffmpeg: $(du -sh bin 2>/dev/null | awk '{print $1}') (含 libs)"
+    du -h bin/ffmpeg bin/ffprobe 2>/dev/null | awk '{print "   ",$1,$2}'
   else
     echo "==> 未找到 bin/ffmpeg，完整包将不含深度抽检二进制（等同 lite）"
   fi
@@ -53,6 +77,36 @@ fi
 
 echo "==> PyInstaller"
 uv run pyinstaller --noconfirm NVRStatus.spec
+
+# PyInstaller 会把 @executable_path 改写成 @rpath，破坏 dylibbundler 结果。
+# 打包后把已修好的 bin/ffmpeg+ffprobe+libs 覆盖回产物内。
+_restore_portable_ffmpeg() {
+  local dest_bin="$1"
+  [[ -f bin/ffmpeg && -d bin/libs ]] || return 0
+  mkdir -p "$dest_bin"
+  echo "==> 恢复可移植 ffmpeg → $dest_bin"
+  /bin/cp -f bin/ffmpeg bin/ffprobe "$dest_bin/"
+  /bin/rm -rf "$dest_bin/libs"
+  /bin/cp -R bin/libs "$dest_bin/"
+  chmod +x "$dest_bin/ffmpeg" "$dest_bin/ffprobe" 2>/dev/null || true
+  if command -v codesign >/dev/null 2>&1; then
+    codesign --force --sign - "$dest_bin/ffmpeg" "$dest_bin/ffprobe" 2>/dev/null || true
+  fi
+  # 冒烟：在产物目录内执行 -version
+  if ! (cd "$dest_bin" && ./ffmpeg -version >/dev/null 2>&1); then
+    echo "==> 警告: 产物内 ffmpeg 无法运行（检查 libs）"
+  else
+    echo "==> 产物内 ffmpeg OK: $(cd "$dest_bin" && ./ffmpeg -version 2>&1 | head -1)"
+  fi
+}
+
+if [[ -d dist/NVRStatus.app/Contents/Frameworks/bin ]]; then
+  _restore_portable_ffmpeg "dist/NVRStatus.app/Contents/Frameworks/bin"
+elif [[ -d dist/NVRStatus/_internal/bin ]]; then
+  _restore_portable_ffmpeg "dist/NVRStatus/_internal/bin"
+elif [[ -d dist/NVRStatus/bin ]]; then
+  _restore_portable_ffmpeg "dist/NVRStatus/bin"
+fi
 
 # 体积报告
 echo "==> 体积"

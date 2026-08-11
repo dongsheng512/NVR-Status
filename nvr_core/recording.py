@@ -6,6 +6,7 @@ B2 拆分：原 HikvisionNVR 的 get_recording_status 与相关检索逻辑。
 from __future__ import annotations
 
 import re
+import uuid
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
@@ -47,6 +48,123 @@ class RecordingMixin:
                 return el.text.strip().lower() == "true"
         return None
 
+    # CMSearch 单页条数。海康对长 lookback 常按时间正序返回；
+    # 仅取前 10 条会漏掉「正在录」的最新段 → 误报「仅有较早片段」。
+    _CMSEARCH_PAGE = 40
+
+    def _cmsearch_page(
+        self,
+        track_id: str,
+        start: datetime,
+        end: datetime,
+        *,
+        max_results: int = 40,
+        position: int = 0,
+        tag: str = "",
+    ) -> Tuple[int, List[ET.Element], int]:
+        """单页 CMSearch。返回 (http_code, searchMatchItem 列表, totalMatches)。
+
+        totalMatches 解析失败时退回本页条数。
+        """
+        start_s = start.strftime("%Y-%m-%dT%H:%M:%SZ")
+        end_s = end.strftime("%Y-%m-%dT%H:%M:%SZ")
+        # 并发 CMSearch 必须用不同 searchID，否则部分固件会串结果/失败
+        search_id = str(uuid.uuid4()).upper()
+        body = f"""<?xml version="1.0" encoding="UTF-8"?>
+<CMSearchDescription>
+  <searchID>{search_id}</searchID>
+  <trackList>
+    <trackID>{track_id}</trackID>
+  </trackList>
+  <timeSpanList>
+    <timeSpan>
+      <startTime>{start_s}</startTime>
+      <endTime>{end_s}</endTime>
+    </timeSpan>
+  </timeSpanList>
+  <maxResults>{int(max_results)}</maxResults>
+  <searchResultPostion>{int(max(0, position))}</searchResultPostion>
+</CMSearchDescription>"""
+        code, text = self._post(
+            "/ContentMgmt/search",
+            body,
+            tag=tag or f"CMSearch track {track_id}",
+            quiet=True,
+            timeout=25,
+            use_thread_session=True,
+        )
+        if code != 200 or not text:
+            return code, [], 0
+        text = re.sub(r'\s+xmlns="[^"]+"', '', text)
+        try:
+            root = ET.fromstring(text)
+        except ET.ParseError:
+            return code, [], 0
+        if root.tag == "ResponseStatus":
+            return code, [], 0
+        matches = root.findall(".//searchMatchItem")
+        total_raw = (
+            root.findtext(".//totalMatches")
+            or root.findtext("totalMatches")
+            or root.findtext(".//numOfMatches")
+            or root.findtext("numOfMatches")
+            or ""
+        )
+        try:
+            total = int(total_raw) if str(total_raw).strip() else len(matches)
+        except (TypeError, ValueError):
+            total = len(matches)
+        return code, matches, max(total, len(matches))
+
+    def _cmsearch_collect(
+        self,
+        track_id: str,
+        start: datetime,
+        end: datetime,
+        *,
+        max_results: Optional[int] = None,
+        tag: str = "",
+    ) -> Tuple[int, List[ET.Element]]:
+        """收集 CMSearch 结果；若总数超过一页，再取末页以覆盖最新片段。
+
+        海康多数固件按 startTime 正序分页：首页=最早，末页=最近。
+        落盘「是否覆盖到现在」必须看到最新段，因此要拉末页。
+        """
+        page = int(max_results or self._CMSEARCH_PAGE)
+        code, matches, total = self._cmsearch_page(
+            track_id, start, end, max_results=page, position=0, tag=tag
+        )
+        if code != 200:
+            return code, []
+        if total <= len(matches) or total <= page:
+            return code, matches
+        # 再取末页（与首页可能重叠，调用方按时间去重/择优）
+        last_pos = max(0, total - page)
+        code2, matches2, _ = self._cmsearch_page(
+            track_id,
+            start,
+            end,
+            max_results=page,
+            position=last_pos,
+            tag=(tag or "") + " last",
+        )
+        if code2 != 200 or not matches2:
+            return code, matches
+        # 合并：用 playbackURI+start 粗去重
+        seen = set()
+        merged: List[ET.Element] = []
+        for item in list(matches) + list(matches2):
+            key = (
+                (item.findtext(".//playbackURI") or "").strip(),
+                (item.findtext(".//startTime") or "").strip(),
+                (item.findtext(".//endTime") or "").strip(),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(item)
+        return code, merged
+
     def _search_track_recent(self, track_id: str, lookback_minutes: int) -> Dict:
         """CMSearch 查询某 track 近 lookback_minutes 分钟是否有录像片段。"""
         empty = {
@@ -62,78 +180,18 @@ class RecordingMixin:
         now = datetime.now(timezone.utc)
         start = now - timedelta(minutes=lookback_minutes)
         end = now + timedelta(minutes=5)
-        start_s = start.strftime("%Y-%m-%dT%H:%M:%SZ")
-        end_s = end.strftime("%Y-%m-%dT%H:%M:%SZ")
-        body = f"""<?xml version="1.0" encoding="UTF-8"?>
-<CMSearchDescription>
-  <searchID>01234567-89AB-CDEF-0123-456789ABCDEF</searchID>
-  <trackList>
-    <trackID>{track_id}</trackID>
-  </trackList>
-  <timeSpanList>
-    <timeSpan>
-      <startTime>{start_s}</startTime>
-      <endTime>{end_s}</endTime>
-    </timeSpan>
-  </timeSpanList>
-  <maxResults>10</maxResults>
-  <searchResultPostion>0</searchResultPostion>
-</CMSearchDescription>"""
 
-        code, text = self._post(
-            "/ContentMgmt/search",
-            body,
+        code, matches = self._cmsearch_collect(
+            track_id,
+            start,
+            end,
             tag=f"录像检索 track {track_id}",
-            quiet=True,
-            timeout=20,
-            use_thread_session=True,
         )
-        if code != 200 or not text:
+        if code != 200:
             empty["detail"] = f"检索失败(HTTP {code})" if code > 0 else "检索失败"
             return empty
-
-        text = re.sub(r'\s+xmlns="[^"]+"', '', text)
-        try:
-            root = ET.fromstring(text)
-        except ET.ParseError:
-            empty["detail"] = "检索结果解析失败"
-            return empty
-
-        if root.tag == "ResponseStatus":
-            empty["detail"] = root.findtext("statusString", "检索失败")
-            return empty
-
-        matches = root.findall(".//searchMatchItem")
-        latest_end: Optional[datetime] = None
-        covers_now = False
-        # 允许当前段 endTime 略早于 now 的容差(秒):连续录像切段/时钟偏差
-        lag_grace = 900  # 15 分钟
-        best_uri: Optional[str] = None
-        best_st: Optional[datetime] = None
-        best_et: Optional[datetime] = None
-        best_score: Tuple[int, float] = (-1, -1.0)
-
-        for item in matches:
-            st = _parse_hik_time(item.findtext(".//startTime"))
-            et = _parse_hik_time(item.findtext(".//endTime"))
-            uri = unescape((item.findtext(".//playbackURI") or "").strip())
-            if et is not None and (latest_end is None or et > latest_end):
-                latest_end = et
-            covers = False
-            if st is not None and et is not None and st <= now <= et + timedelta(seconds=lag_grace):
-                covers_now = True
-                covers = True
-            elif et is not None and et >= now - timedelta(seconds=lag_grace):
-                covers_now = True
-                covers = True
-            # 优先选覆盖当前的片段,其次 end 最晚
-            score = (2 if covers else 0, et.timestamp() if et else 0.0)
-            if uri and score >= best_score:
-                best_score = score
-                best_uri = uri
-                best_st, best_et = st, et
-
         if not matches:
+            # 区分「真失败」与「无片段」：code 200 且空列表 → 无录像
             return {
                 "ok": False,
                 "status": "异常",
@@ -144,6 +202,70 @@ class RecordingMixin:
                 "seg_start": None,
                 "seg_end": None,
             }
+
+        # 允许当前段 endTime 略早于 now 的容差(秒):连续录像切段/时钟偏差
+        lag_grace = 900  # 15 分钟
+
+        def _pick(items: List[ET.Element]) -> Tuple[
+            bool, Optional[datetime], Optional[str], Optional[datetime], Optional[datetime]
+        ]:
+            latest: Optional[datetime] = None
+            covers = False
+            best_uri: Optional[str] = None
+            best_st: Optional[datetime] = None
+            best_et: Optional[datetime] = None
+            best_score: Tuple[int, float] = (-1, -1.0)
+            for item in items:
+                st = _parse_hik_time(item.findtext(".//startTime"))
+                et = _parse_hik_time(item.findtext(".//endTime"))
+                uri = unescape((item.findtext(".//playbackURI") or "").strip())
+                if et is not None and (latest is None or et > latest):
+                    latest = et
+                this_covers = False
+                if st is not None and et is not None and st <= now <= et + timedelta(seconds=lag_grace):
+                    covers = True
+                    this_covers = True
+                elif et is not None and et >= now - timedelta(seconds=lag_grace):
+                    covers = True
+                    this_covers = True
+                score = (2 if this_covers else 0, et.timestamp() if et else 0.0)
+                if uri and score >= best_score:
+                    best_score = score
+                    best_uri = uri
+                    best_st, best_et = st, et
+            return covers, latest, best_uri, best_st, best_et
+
+        covers_now, latest_end, best_uri, best_st, best_et = _pick(matches)
+
+        # 长 lookback 且未覆盖：再查近 90 分钟窗口。
+        # 防御 totalMatches 不可信、未触发末页时仍漏掉最新段的情况。
+        if (not covers_now) and lookback_minutes > 90:
+            code_r, recent = self._cmsearch_collect(
+                track_id,
+                now - timedelta(minutes=90),
+                end,
+                tag=f"录像检索(近90分) track {track_id}",
+            )
+            if code_r == 200 and recent:
+                # 合并后再判
+                seen = {
+                    (
+                        (m.findtext(".//playbackURI") or "").strip(),
+                        (m.findtext(".//startTime") or "").strip(),
+                        (m.findtext(".//endTime") or "").strip(),
+                    )
+                    for m in matches
+                }
+                for m in recent:
+                    key = (
+                        (m.findtext(".//playbackURI") or "").strip(),
+                        (m.findtext(".//startTime") or "").strip(),
+                        (m.findtext(".//endTime") or "").strip(),
+                    )
+                    if key not in seen:
+                        matches.append(m)
+                        seen.add(key)
+                covers_now, latest_end, best_uri, best_st, best_et = _pick(matches)
 
         if covers_now:
             detail = "近期有录像"
@@ -299,45 +421,17 @@ class RecordingMixin:
             "detail": "",
         }
         # 查询窗口略放大,便于命中跨段录像
-        q_start = (start - timedelta(minutes=5)).strftime("%Y-%m-%dT%H:%M:%SZ")
-        q_end = (end + timedelta(minutes=5)).strftime("%Y-%m-%dT%H:%M:%SZ")
-        body = f"""<?xml version="1.0" encoding="UTF-8"?>
-<CMSearchDescription>
-  <searchID>01234567-89AB-CDEF-0123-456789ABCDEF</searchID>
-  <trackList>
-    <trackID>{track_id}</trackID>
-  </trackList>
-  <timeSpanList>
-    <timeSpan>
-      <startTime>{q_start}</startTime>
-      <endTime>{q_end}</endTime>
-    </timeSpan>
-  </timeSpanList>
-  <maxResults>10</maxResults>
-  <searchResultPostion>0</searchResultPostion>
-</CMSearchDescription>"""
-        code, text = self._post(
-            "/ContentMgmt/search",
-            body,
+        q_start = start - timedelta(minutes=5)
+        q_end = end + timedelta(minutes=5)
+        code, matches = self._cmsearch_collect(
+            track_id,
+            q_start,
+            q_end,
             tag=f"繁忙时段检索 track {track_id}",
-            quiet=True,
-            timeout=20,
-            use_thread_session=True,
         )
-        if code != 200 or not text:
+        if code != 200:
             empty["detail"] = f"检索失败(HTTP {code})" if code > 0 else "检索失败"
             return empty
-        text = re.sub(r'\s+xmlns="[^"]+"', '', text)
-        try:
-            root = ET.fromstring(text)
-        except ET.ParseError:
-            empty["detail"] = "检索结果解析失败"
-            return empty
-        if root.tag == "ResponseStatus":
-            empty["detail"] = root.findtext("statusString", "检索失败")
-            return empty
-
-        matches = root.findall(".//searchMatchItem")
         if not matches:
             empty["detail"] = "繁忙时段无录像片段"
             return empty

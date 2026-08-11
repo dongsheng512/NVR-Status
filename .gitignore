@@ -27,6 +27,8 @@ bin/ffmpeg
 bin/ffprobe
 bin/ffmpeg.exe
 bin/ffprobe.exe
+# dylibbundler 产出的依赖库
+bin/libs/
 
 # 会话/临时笔记（非项目文档）
 cam.md
