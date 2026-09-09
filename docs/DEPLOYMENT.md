@@ -1,6 +1,6 @@
 # 部署与分发文档
 
-> 适用版本：2.0.0（PySide6 GUI）  
+> 适用版本：2.2.0（PySide6 GUI）  
 > 目标：同事 **安装即用**（状态巡检 + 可选深度抽检 + 多配置档案）  
 > GUI 已由 CustomTkinter 重写为 PySide6，见 [PLAN.md](PLAN.md)。
 
@@ -115,7 +115,7 @@ uv pip install pyinstaller
 
 **分发给同事：**
 
-1. 打 zip：`NVRStatus-macOS-2.0.0.zip`  
+1. 打 zip：`NVRStatus-macOS-arm64.zip`（脚本默认名；分发时可改名为 `NVRStatus-macOS-2.2.0.zip`）  
 2. 解压后拖到「应用程序」  
 3. 若无法打开（未签名）：
 
@@ -138,7 +138,7 @@ powershell -ExecutionPolicy Bypass -File build\build_win.ps1
 
 **分发：**
 
-1. 整夹压缩为 `NVRStatus-Windows-2.0.0.zip`  
+1. 整夹压缩为 `NVRStatus-Windows-2.2.0.zip` 
 2. 用户解压后双击 `NVRStatus.exe`  
 3. （可选）用 Inno Setup / NSIS 做成安装程序  
 

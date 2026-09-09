@@ -28,6 +28,7 @@ _STATE_DETAILS = {
 class StatusBar(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
+        self.setObjectName("AppStatusBar")
         root = QHBoxLayout(self)
         root.setContentsMargins(12, 6, 12, 6)
         root.setSpacing(8)
@@ -52,6 +53,8 @@ class StatusBar(QWidget):
         self.pct_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         self.pct_label.setStyleSheet("color: " + theme.ui_color("muted", False) + ";")
         root.addWidget(self.pct_label)
+        for lab in (self.dot, self.state_label, self.detail_label, self.pct_label):
+            lab.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
 
         self.progress = QProgressBar()
         self.progress.setRange(0, 1000)
@@ -79,13 +82,13 @@ class StatusBar(QWidget):
         self._state = state
         self.state_label.setText(text if text is not None else _STATE_LABELS[state])
         self.detail_label.setText(detail or _STATE_DETAILS[state])
+        running = state == "running"
+        self.progress.setVisible(running)
+        self.pct_label.setVisible(running)
         self._refresh_colors()
 
     def _refresh_colors(self) -> None:
         dot_color, bar_color = theme.STATE_DOT.get(self._state, theme.STATE_DOT["ready"])
-        if self._dark:
-            dot_color, bar_color = theme.STATE_DOT.get(self._state, theme.STATE_DOT["ready"])
-            bar_color = bar_color
         self.dot.setStyleSheet(f"color: {dot_color}; font-size: 14px;")
         self.state_label.setStyleSheet(f"color: {dot_color};")
         self.progress.setStyleSheet(
@@ -106,3 +109,6 @@ class StatusBar(QWidget):
     def reset_progress(self) -> None:
         self.progress.setValue(0)
         self.pct_label.setText("")
+        if self._state != "running":
+            self.progress.hide()
+            self.pct_label.hide()

@@ -25,19 +25,13 @@ from nvr_core.util import (
     _which_tools,
 )
 
-# 抑制 HTTPS 自签证书的告警
-try:
-    import urllib3
-    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-except Exception:
-    pass
-
 
 class ISAPIClient:
     """ISAPI 会话与设备基础信息。业务 mixin 以 self 组合使用。"""
 
     AV_SECONDS_MAX = 12
     AV_WORKERS_MAX = 3
+    SEARCH_WORKERS_MAX = 16
     # 默认保存根目录名(位于项目文件夹下)
     AV_SAVE_ROOT_NAME = "av_samples"
 
@@ -72,7 +66,7 @@ class ISAPIClient:
         # 落盘检查窗口最长 30 天
         self.lookback_minutes = max(1, min(int(lookback_minutes), 30 * 24 * 60))
         self.check_disk_recording = check_disk_recording
-        self.search_workers = max(1, search_workers)
+        self.search_workers = max(1, min(int(search_workers), self.SEARCH_WORKERS_MAX))
         # GUI 等场景: quiet 抑制终端输出; progress_callback(msg: str) 汇报进度
         self.quiet = quiet
         self.progress_callback = progress_callback
@@ -104,19 +98,41 @@ class ISAPIClient:
         self.session = requests.Session()
         self.session.auth = HTTPDigestAuth(username, password)
         self.session.headers.update({"User-Agent": "hikvision_status/1.0"})
+        # NVR 常见自签证书:SSL 模式跳过校验(内网工具,风险见 README 安全说明),
+        # 首次请求时会向用户输出一次性提示
+        self.session.verify = not use_ssl
+        self._ssl_notice_shown = False
+        # 线程本地/注册表: close() 时统一回收连接池
+        self._sessions_lock = threading.Lock()
+        self._all_sessions: List[requests.Session] = [self.session]
+        # 线程本地 Session,用于并发 CMSearch
+        self._thread_local = threading.local()
         if use_ssl:
-            # 自签证书:不校验
-            self.session.verify = False
+            # 告警抑制仅在确有 HTTPS 时做(进程级,尽量晚、尽量少)
+            try:
+                import urllib3
+                urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+            except Exception:
+                pass
 
         # 端点缓存:全流程每个端点只请求一次
         self._cache: Dict[str, Optional[ET.Element]] = {}
         self._recording_cache: Optional[List[Dict]] = None
-        # 线程本地 Session,用于并发 CMSearch
-        self._thread_local = threading.local()
+        self._cameras_cache: Optional[List[Dict]] = None
         self._tools = _which_tools()
         self._save_lock = threading.Lock()
         # 设备时区缓存(从设备时间串解析,默认东八区)
         self._device_tz: Optional[timezone] = None
+
+    def close(self) -> None:
+        """关闭全部会话(含线程本地),释放连接池。多设备队列逐台调用。"""
+        with self._sessions_lock:
+            sessions, self._all_sessions = self._all_sessions, []
+        for sess in sessions:
+            try:
+                sess.close()
+            except Exception:
+                pass
 
     def _log(self, msg: str, force: bool = False) -> None:
         """进度/日志: quiet 时仅回调; 否则打印并回调。"""
@@ -183,7 +199,11 @@ class ISAPIClient:
             raise ScanCancelled("巡检已取消")
 
     def _get_device_tz(self) -> timezone:
-        """获取设备时区:优先解析设备当前时间中的偏移,否则用本机本地时区。"""
+        """获取设备时区:优先解析设备当前时间中的偏移,否则用本机本地时区。
+
+        仅在成功解析设备偏移时缓存;回退值不缓存,网络恢复后可重试,
+        避免本机时区错误被固化为后续 RTSP 时间改写的基准。
+        """
         if self._device_tz is not None:
             return self._device_tz
         # 尝试设备状态里的 currentDeviceTime, 如 2026-07-29T12:36:13+08:00
@@ -199,10 +219,9 @@ class ISAPIClient:
                 return self._device_tz
         except Exception:
             pass
-        # 回退:本机本地时区(通常与设备同在东八区)
+        # 回退:本机本地时区(通常与设备同在东八区),不缓存
         local = datetime.now().astimezone()
-        self._device_tz = local.tzinfo if local.tzinfo else timezone(timedelta(hours=8))
-        return self._device_tz  # type: ignore[return-value]
+        return local.tzinfo if local.tzinfo else timezone(timedelta(hours=8))
 
     def _fmt_rtsp_time(self, dt: datetime) -> str:
         """格式化为海康 RTSP starttime/endtime。
@@ -221,29 +240,40 @@ class ISAPIClient:
             sess = requests.Session()
             sess.auth = HTTPDigestAuth(self.username, self.password)
             sess.headers.update({"User-Agent": "hikvision_status/1.0"})
-            if self.use_ssl:
-                sess.verify = False
+            sess.verify = not self.use_ssl
             self._thread_local.session = sess
+            with self._sessions_lock:
+                self._all_sessions.append(sess)
         return sess
 
-    def _get(self, endpoint: str, tag: str = "", quiet: bool = False) -> str:
-        """GET /ISAPI<endpoint>,返回原始文本。失败时打印可见警告并返回空串。"""
+    def _get(self, endpoint: str, tag: str = "", quiet: bool = False) -> Optional[str]:
+        """GET /ISAPI<endpoint>。
+
+        返回: 正文文本; ""=HTTP 非 200(端点不支持/拒绝,重试无意义);
+        None=瞬时网络失败(超时/连接错误,调用方不应负缓存)。
+        """
+        if self.use_ssl and not self._ssl_notice_shown:
+            self._ssl_notice_shown = True
+            self._log("⚠️ HTTPS 模式已跳过证书校验(自签证书),仅限可信内网使用", force=True)
         url = f"{self.base_url}/ISAPI{endpoint}"
         try:
             resp = self.session.get(url, timeout=10)
         except requests.exceptions.Timeout:
-            if not quiet and not self.quiet:
-                print(f"  {Colors.error('⚠️ ' + (tag or endpoint) + '获取失败: 请求超时')}")
-            return ""
+            self._warn_fail(tag or endpoint, "请求超时", quiet)
+            return None
         except requests.exceptions.RequestException as e:
-            if not quiet and not self.quiet:
-                print(f"  {Colors.error('⚠️ ' + (tag or endpoint) + '获取失败: ' + str(e))}")
-            return ""
+            self._warn_fail(tag or endpoint, str(e), quiet)
+            return None
         if resp.status_code != 200:
-            if not quiet and not self.quiet:
-                print(f"  {Colors.error('⚠️ ' + (tag or endpoint) + f'获取失败: HTTP {resp.status_code}')}")
+            self._warn_fail(tag or endpoint, f"HTTP {resp.status_code}", quiet)
             return ""
         return resp.text
+
+    def _warn_fail(self, tag: str, reason: str, quiet: bool) -> None:
+        """端点失败提示: CLI 打印,GUI 经回调可见(quiet 探测除外)。"""
+        if quiet:
+            return
+        self._log(f"⚠️ {tag}获取失败: {reason}", force=True)
 
     def _post(
         self,
@@ -254,7 +284,7 @@ class ISAPIClient:
         timeout: int = 15,
         use_thread_session: bool = False,
     ) -> Tuple[int, str]:
-        """POST /ISAPI<endpoint>,返回 (status_code, text)。"""
+        """POST /ISAPI<endpoint>,返回 (status_code, text)。失败码 -1。"""
         url = f"{self.base_url}/ISAPI{endpoint}"
         sess = self._thread_session() if use_thread_session else self.session
         try:
@@ -265,31 +295,57 @@ class ISAPIClient:
                 headers={"Content-Type": "application/xml"},
             )
         except requests.exceptions.Timeout:
-            if not quiet and not self.quiet:
-                print(f"  {Colors.error('⚠️ ' + (tag or endpoint) + '请求失败: 请求超时')}")
+            if not quiet:
+                self._log(f"⚠️ {tag or endpoint}请求失败: 请求超时", force=True)
             return -1, ""
         except requests.exceptions.RequestException as e:
-            if not quiet and not self.quiet:
-                print(f"  {Colors.error('⚠️ ' + (tag or endpoint) + '请求失败: ' + str(e))}")
+            if not quiet:
+                self._log(f"⚠️ {tag or endpoint}请求失败: {e}", force=True)
             return -1, ""
         return resp.status_code, resp.text or ""
 
+    _XML_MAX_BYTES = 8 * 1024 * 1024
+
+    @staticmethod
+    def _reject_dtd(text: str) -> bool:
+        """设备 XML 中出现 DOCTYPE/ENTITY 时拒绝解析(防实体扩展攻击)。"""
+        head = text[:4096].lower()
+        return "<!doctype" in head or "<!entity" in head
+
+    def _safe_fromstring(self, text: str, tag: str = "") -> Optional[ET.Element]:
+        """解析设备返回的 XML:拒绝 DTD/实体、限制大小。"""
+        if self._reject_dtd(text):
+            if not self.quiet:
+                print(f"  {Colors.error('⚠️ ' + (tag or 'XML') + '含 DOCTYPE/ENTITY, 已拒绝解析')}")
+            return None
+        if len(text.encode("utf-8", "ignore")) > self._XML_MAX_BYTES:
+            if not self.quiet:
+                print(f"  {Colors.error('⚠️ ' + (tag or 'XML') + '响应过大, 已拒绝解析')}")
+            return None
+        try:
+            return ET.fromstring(text)
+        except ET.ParseError:
+            return None
+
     def _parse(self, endpoint: str, tag: str = "") -> Optional[ET.Element]:
-        """请求并解析XML。带缓存:同一端点只请求一次。失败返回None。"""
+        """请求并解析XML。带缓存:同一端点只请求一次。失败返回None。
+
+        仅「确定性失败」入负缓存(HTTP 非200=端点不支持、解析失败);
+        瞬时网络失败(超时等)不缓存,后续调用可重试。
+        """
         if endpoint in self._cache:
             return self._cache[endpoint]
         text = self._get(endpoint, tag)
-        if not text:
-            self._cache[endpoint] = None
+        if text is None:
+            # 瞬时失败:不入缓存
             return None
-        # 移除命名空间以便于解析
-        text = re.sub(r'\s+xmlns="[^"]+"', '', text)
-        try:
-            root = ET.fromstring(text)
-        except ET.ParseError as e:
-            if not self.quiet:
-                print(f"  {Colors.error('⚠️ ' + (tag or endpoint) + '解析失败: ' + str(e))}")
+        root: Optional[ET.Element]
+        if not text:
             root = None
+        else:
+            # 移除命名空间以便于解析
+            text = re.sub(r'\s+xmlns="[^"]+"', '', text)
+            root = self._safe_fromstring(text, tag or endpoint)
         self._cache[endpoint] = root
         return root
 
@@ -298,14 +354,14 @@ class ISAPIClient:
         if endpoint in self._cache:
             return self._cache[endpoint]
         text = self._get(endpoint, tag="", quiet=True)
-        if not text:
-            self._cache[endpoint] = None
+        if text is None:
             return None
-        text = re.sub(r'\s+xmlns="[^"]+"', "", text)
-        try:
-            root = ET.fromstring(text)
-        except ET.ParseError:
+        root: Optional[ET.Element]
+        if not text:
             root = None
+        else:
+            text = re.sub(r'\s+xmlns="[^"]+"', "", text)
+            root = self._safe_fromstring(text)
         self._cache[endpoint] = root
         return root
 
@@ -367,15 +423,19 @@ class ISAPIClient:
         return alarms
 
     def get_cameras(self) -> List[Dict]:
-        """获取摄像头真实连接状态。
+        """获取摄像头真实连接状态(带缓存:一次巡检内只请求一次)。
 
         优先使用 InputProxy 接口(可获取在线/离线、名称、IP、型号);
         设备不支持时回退到 Streaming channels(仅统计已配置通道数)。
         """
+        if self._cameras_cache is not None:
+            return self._cameras_cache
         cameras = self._get_input_proxy_cameras()
         if cameras is not None:
+            self._cameras_cache = cameras
             return cameras
-        return self._get_streaming_channels()
+        self._cameras_cache = self._get_streaming_channels()
+        return self._cameras_cache
 
     def _get_input_proxy_cameras(self) -> Optional[List[Dict]]:
         """通过 InputProxy 接口获取摄像头列表(含真实在线状态)。不支持时返回None。"""

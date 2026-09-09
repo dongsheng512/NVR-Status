@@ -8,11 +8,12 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Optional
 
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QColor, QTextCharFormat, QTextCursor
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
-    QGroupBox,
+    QFrame,
     QHBoxLayout,
     QLabel,
     QPlainTextEdit,
@@ -25,15 +26,20 @@ from PySide6.QtWidgets import (
 from ui import theme
 
 LOG_MAX_LINES = 5000
+_COLLAPSED_H = 48
 
 
-class LogPanel(QGroupBox):
-    """运行日志面板：彩色分级日志 + 提示行 + 图例 + 复制/清空/自动滚动。"""
+class LogPanel(QFrame):
+    """运行日志：巡检中展开，完成后可收成一行。"""
+
+    expanded_changed = Signal(bool)
 
     def __init__(self, parent: Optional[QWidget] = None):
-        super().__init__("运行日志", parent)
-        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Maximum)
+        super().__init__(parent)
+        self.setObjectName("Card")
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self._log_line_count = 0
+        self._expanded = True
 
         root = QVBoxLayout(self)
         root.setContentsMargins(8, 6, 8, 6)
@@ -41,6 +47,12 @@ class LogPanel(QGroupBox):
 
         head = QHBoxLayout()
         head.setSpacing(6)
+        self.btn_toggle = QPushButton("▼  运行日志")
+        self.btn_toggle.setProperty("role", "toggle")
+        self.btn_toggle.setToolTip("展开 / 折叠运行日志")
+        self.btn_toggle.clicked.connect(self.toggle)
+        head.addWidget(self.btn_toggle)
+
         self._log_hint = QLabel("等待操作…")
         self._log_hint.setStyleSheet("color: " + theme.ui_color("muted", False) + ";")
         head.addWidget(self._log_hint, 1)
@@ -70,12 +82,46 @@ class LogPanel(QGroupBox):
         self.log_box = QPlainTextEdit()
         self.log_box.setReadOnly(True)
         self.log_box.setFont(theme.mono_font(10))
-        self.log_box.setFixedHeight(96)  # 原 72，增高约 1/3
-        self.log_box.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        root.addWidget(self.log_box)
+        self.log_box.setMinimumHeight(80)
+        self.log_box.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
+        )
+        root.addWidget(self.log_box, 1)
 
         btn_copy.clicked.connect(self.copy_log)
         btn_clear.clicked.connect(self.clear_log)
+
+    def toggle(self) -> None:
+        self.set_expanded(not self._expanded)
+
+    def set_expanded(self, expanded: bool, *, notify: bool = True) -> None:
+        expanded = bool(expanded)
+        changed = expanded != self._expanded
+        self._expanded = expanded
+        self.log_box.setVisible(expanded)
+        self.chk_autoscroll.setVisible(expanded)
+        for lbl in self._legend_labels:
+            lbl.setVisible(expanded)
+        arrow = "▼" if expanded else "▶"
+        self.btn_toggle.setText(f"{arrow}  运行日志")
+        if expanded:
+            self.setMaximumHeight(16777215)
+            self.setSizePolicy(
+                QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
+            )
+            self.log_box.setMinimumHeight(80)
+        else:
+            self.log_box.setMinimumHeight(0)
+            self.setSizePolicy(
+                QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Maximum
+            )
+            self.setMaximumHeight(_COLLAPSED_H)
+        if notify and changed:
+            self.expanded_changed.emit(expanded)
+
+    @property
+    def expanded(self) -> bool:
+        return self._expanded
 
     # ---------- 配色 ----------
 
@@ -182,11 +228,12 @@ class LogPanel(QGroupBox):
     def _trim_log(self) -> None:
         if self._log_line_count <= LOG_MAX_LINES:
             return
-        block = self.log_box.document().firstBlock()
-        cursor = QTextCursor(block)
+        # 连块及块分隔符一起删除，否则文档顶部残留空行、
+        # 后续 insertText(End) 会把新日志拼进上一行。
+        cursor = QTextCursor(self.log_box.document().firstBlock())
         cursor.select(QTextCursor.SelectionType.BlockUnderCursor)
+        cursor.movePosition(QTextCursor.MoveOperation.NextBlock, QTextCursor.MoveMode.KeepAnchor)
         cursor.removeSelectedText()
-        self.log_box.textCursor().deletePreviousChar()
         self._log_line_count -= 1
 
     def clear_log(self) -> None:

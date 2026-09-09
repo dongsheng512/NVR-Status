@@ -25,7 +25,45 @@ from ui import theme
 from ui.widgets.channel_table import ChannelTableView, row_tag
 
 
-# 指标卡固定名称：未巡检时也显示，避免只剩 "—"
+IDLE_SUMMARY = "尚未扫描 — 选择设备后点击「快速巡检」"
+
+
+def summarize_warn_lines(lines: Optional[List[str]]) -> str:
+    """预警全文 → 一行摘要（详情里仍保留硬盘明细）。"""
+    alerts: List[str] = []
+    extra: List[str] = []
+    for raw in lines or []:
+        s = str(raw).strip()
+        if s.startswith("•") or s.startswith("-") or s.startswith("·"):
+            s = s.lstrip("•·- ").strip()
+        if not s or s in ("预警：", "预警:", "预警：无"):
+            continue
+        if s.startswith("硬盘："):
+            continue
+        if s.startswith("循环覆盖"):
+            extra.append(s)
+            continue
+        if s.startswith("说明：") or s.startswith("抽检") or s.startswith("片段目录"):
+            extra.append(s)
+            continue
+        alerts.append(s)
+    if not alerts and not extra:
+        return "预警：无"
+    parts: List[str] = []
+    for a in alerts[:2]:
+        parts.append(a.split("（")[0].strip() or a)
+    for e in extra:
+        if "开启" in e:
+            parts.append("循环覆盖已开启")
+            break
+        if e.startswith("抽检"):
+            parts.append(e[:28])
+            break
+    if len(alerts) > 2:
+        parts.append(f"等{len(alerts)}条")
+    return " · ".join(parts) if parts else "预警：无"
+
+# 指标卡固定名称：未巡检时也显示，数值为 "—"
 METRIC_TITLES: Dict[str, str] = {
     "health": "健康状态",
     "online": "摄像头在线",
@@ -41,7 +79,7 @@ class MetricCard(QFrame):
         "ok": "#1a7f37",
         "warn": "#b26a00",
         "bad": "#c62828",
-        "muted": "#8b949e",
+        "muted": "#8E8E93",
     }
 
     def __init__(
@@ -54,16 +92,16 @@ class MetricCard(QFrame):
         self._tone = "muted"
         self._title_text = title
         self.setObjectName("Card")
-        self.setMinimumHeight(54)
-        self.setMaximumHeight(58)
+        self.setMinimumHeight(40)
+        self.setMaximumHeight(44)
         root = QVBoxLayout(self)
-        root.setContentsMargins(10, 5, 10, 5)
-        root.setSpacing(1)
+        root.setContentsMargins(8, 3, 8, 3)
+        root.setSpacing(0)
         self.title = QLabel(title)
         self.title.setStyleSheet(self._title_style(False))
         self.value = QLabel("—")
         f = self.value.font()
-        f.setPointSize(14)
+        f.setPointSize(13)
         f.setBold(True)
         self.value.setFont(f)
         root.addWidget(self.title)
@@ -79,7 +117,7 @@ class MetricCard(QFrame):
         return (
             "color: "
             + theme.ui_color("muted", dark)
-            + "; font-size: 12px; font-weight: 600;"
+            + "; font-size: 11px; font-weight: 600;"
         )
 
     def set_metric(self, title: str, value: str, tone: str = "normal", tip: str = "") -> None:
@@ -100,7 +138,7 @@ class MetricCard(QFrame):
         light, dark = colors.get(tone, colors["normal"])
         accent = self._ACCENT[self._tone]
         self.value.setStyleSheet(
-            f"color: {light if not self._dark else dark}; font-size: 14px; font-weight: 700;"
+            f"color: {light if not self._dark else dark}; font-size: 13px; font-weight: 700;"
         )
         self.title.setStyleSheet(self._title_style(self._dark))
         self.setStyleSheet(
@@ -108,8 +146,8 @@ class MetricCard(QFrame):
         )
 
     def reset_idle(self) -> None:
-        """未巡检 / 清空结果：保留名称，数值显示待检查。"""
-        self.set_metric(self._title_text, "待检查", "muted")
+        """未巡检 / 清空结果：保留名称，数值用破折号，避免假数据感。"""
+        self.set_metric(self._title_text, "—", "muted")
 
     def set_dark(self, dark: bool) -> None:
         self._dark = dark
@@ -245,11 +283,9 @@ class ResultsExpandWindow(QWidget):
         self.channel_table.export_requested.connect(self.export_requested.emit)
         root.addWidget(self.channel_table, 1)
 
-        tip = QLabel("提示：双击行查看通道详情 · 右键可复制/导出 · 支持「仅异常 / 仅离线」筛选")
-        tip.setStyleSheet(
-            "color: " + theme.ui_color("muted", theme.effective_dark()) + "; font-size: 11px;"
-        )
-        root.addWidget(tip)
+        self.tip_label = QLabel("提示：双击行查看通道详情 · 右键可复制/导出 · 支持「仅异常 / 仅离线」筛选")
+        root.addWidget(self.tip_label)
+        self.set_dark(theme.effective_dark())
 
     def _on_double_click(self, index) -> None:
         if not index.isValid():
@@ -273,6 +309,9 @@ class ResultsExpandWindow(QWidget):
 
     def set_dark(self, dark: bool) -> None:
         self.channel_table.set_dark(dark)
+        self.tip_label.setStyleSheet(
+            "color: " + theme.ui_color("muted", dark) + "; font-size: 11px;"
+        )
 
 
 class ResultsPanel(QWidget):
@@ -284,6 +323,7 @@ class ResultsPanel(QWidget):
     export_requested = Signal()
     detail_requested = Signal(object)
     log_requested = Signal(str, str)
+    layout_mode_changed = Signal(bool)  # True=有巡检结果（通道表展开）
 
     def __init__(self, parent: Optional[QWidget] = None):
         super().__init__(parent)
@@ -295,11 +335,11 @@ class ResultsPanel(QWidget):
         self._detail_dialog: Optional[ChannelDetailDialog] = None
 
         root = QVBoxLayout(self)
-        root.setContentsMargins(6, 0, 0, 0)
-        root.setSpacing(6)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(8)
 
         # 汇总标题（略缩小字号/行距，整体状态区约减 1/3 高度）
-        self.summary_label = QLabel("尚未扫描 — 配置设备后点击「快速巡检」或「深度巡检」")
+        self.summary_label = QLabel(IDLE_SUMMARY)
         f = self.summary_label.font()
         f.setPointSize(12)
         f.setBold(True)
@@ -313,9 +353,10 @@ class ResultsPanel(QWidget):
             "color: " + theme.ui_color("muted", False) + "; font-size: 11px;"
         )
         self.device_sub_label.setMaximumHeight(20)
+        self.device_sub_label.hide()
         root.addWidget(self.device_sub_label)
 
-        # 指标卡片：始终显示名称，未巡检时数值为「待检查」
+        # 指标卡片：始终显示名称，未巡检时数值为「—」
         metrics_row = QHBoxLayout()
         metrics_row.setSpacing(4)
         self._metric_cards: Dict[str, MetricCard] = {}
@@ -326,21 +367,39 @@ class ResultsPanel(QWidget):
             metrics_row.addWidget(card, 1)
         root.addLayout(metrics_row)
 
-        # 预警：用状态区省下的高度加高，便于多条预警
+        # 预警：默认一行摘要，点开才显示全文
+        self.warn_toggle = QPushButton("▶  预警：无")
+        self.warn_toggle.setProperty("role", "toggle")
+        self.warn_toggle.setToolTip("展开 / 折叠预警详情")
+        self.warn_toggle.clicked.connect(self._toggle_warn)
+        self.warn_toggle.hide()
+        root.addWidget(self.warn_toggle)
+
         self.warn_box = QTextEdit()
         self.warn_box.setObjectName("WarnBox")
         self.warn_box.setReadOnly(True)
         self.warn_box.setMaximumHeight(120)
-        self.warn_box.setMinimumHeight(72)
+        self.warn_box.setMinimumHeight(48)
         self.warn_box.setSizePolicy(
             QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred
         )
         self.warn_box.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         self.warn_box.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.warn_box.document().setDocumentMargin(2)
+        self.warn_box.hide()
         root.addWidget(self.warn_box)
+        self._warn_expanded = False
 
-        # 通道表：略减最小高度，把垂直空间让给运行日志
+        # 空闲态用一行提示，不占一整块空白；有结果后再展开通道表
+        self.idle_hint = QLabel("巡检后显示通道列表")
+        self.idle_hint.setAlignment(
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
+        )
+        self.idle_hint.setStyleSheet(
+            "color: " + theme.ui_color("muted", False) + "; font-size: 12px;"
+        )
+        root.addWidget(self.idle_hint)
+
         self.channel_table = ChannelTableView()
         self.channel_table.setMinimumHeight(180)
         self.channel_table.setSizePolicy(
@@ -350,7 +409,12 @@ class ResultsPanel(QWidget):
         self.channel_table.detail_requested.connect(self.open_channel_detail)
         self.channel_table.export_requested.connect(self.export_requested.emit)
         self.channel_table.expand_requested.connect(self.show_results_window)
+        self.channel_table.hide()
         root.addWidget(self.channel_table, 1)
+        self.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred
+        )
+        self._sync_result_chrome()
 
     def _channel_record_at(self, index) -> Optional[Dict[str, Any]]:
         src = self.channel_table.proxy.mapToSource(index)
@@ -370,6 +434,9 @@ class ResultsPanel(QWidget):
         self.device_sub_label.setStyleSheet(
             f"color: {theme.ui_color('muted', dark)}; font-size: 11px;"
         )
+        self.idle_hint.setStyleSheet(
+            f"color: {theme.ui_color('muted', dark)}; font-size: 12px;"
+        )
         if self._results_window is not None:
             self._results_window.set_dark(dark)
         if self._detail_dialog is not None:
@@ -378,6 +445,8 @@ class ResultsPanel(QWidget):
         if self._last_warn_lines is not None:
             self.warn_box.setHtml(self._warn_html(self._last_warn_lines, dark))
             self.warn_box.document().setDocumentMargin(2)
+            arrow = "▼" if self._warn_expanded else "▶"
+            self.warn_toggle.setText(f"{arrow}  {summarize_warn_lines(self._last_warn_lines)}")
 
     # ---------- 详情窗 / 大窗 ----------
 
@@ -476,11 +545,41 @@ class ResultsPanel(QWidget):
             f'<body style="margin:0;padding:0;">{body}</body>'
         )
 
+    def _toggle_warn(self) -> None:
+        if self._last_warn_lines is None:
+            return
+        self._warn_expanded = not self._warn_expanded
+        self.warn_box.setVisible(self._warn_expanded)
+        arrow = "▼" if self._warn_expanded else "▶"
+        self.warn_toggle.setText(
+            f"{arrow}  {summarize_warn_lines(self._last_warn_lines)}"
+        )
+
+    def _sync_result_chrome(self) -> None:
+        filled = self._last_result is not None
+        self.idle_hint.setVisible(not filled)
+        self.channel_table.setVisible(filled)
+        self.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Expanding if filled else QSizePolicy.Policy.Preferred,
+        )
+        self.layout_mode_changed.emit(filled)
+
     def clear_result(self) -> None:
+        self._last_result = None
+        self._last_warn_lines = None
+        self._last_metrics_snapshot = []
+        self.summary_label.setText(IDLE_SUMMARY)
+        self.device_sub_label.clear()
+        self.device_sub_label.hide()
         self.channel_table.set_records([], False)
+        self.channel_table.set_result_actions_enabled(False)
         self.warn_box.clear()
+        self.warn_box.hide()
+        self.warn_toggle.hide()
+        self._warn_expanded = False
+        self._sync_result_chrome()
         for key, card in self._metric_cards.items():
-            # 清空结果时仍保留指标名称
             card._title_text = METRIC_TITLES.get(key, card._title_text)
             card.reset_idle()
 
@@ -495,10 +594,17 @@ class ResultsPanel(QWidget):
         name = data.get("device_name") or ""
         self._last_channel_deep = deep
 
-        self.summary_label.setText(f"健康：{status}    ·    {name}")
-        self.device_sub_label.setText(
-            f"{info.get('型号') or '-'}  ·  固件 {info.get('固件版本') or '-'}  ·  通道 {len(records)}"
-        )
+        bits = [f"健康：{status}"]
+        if name:
+            bits.append(str(name))
+        model = (info.get("型号") or "").strip()
+        if model and model != "-":
+            bits.append(model)
+        bits.append(f"{len(records)} 路")
+        self.summary_label.setText("  ·  ".join(bits))
+        fw = (info.get("固件版本") or "").strip()
+        self.summary_label.setToolTip(f"固件 {fw}" if fw and fw != "-" else "")
+        self.device_sub_label.hide()
 
         online = stats.get("摄像头在线", 0)
         offline = stats.get("摄像头离线", 0)
@@ -599,9 +705,15 @@ class ResultsPanel(QWidget):
         self._last_warn_lines = list(lines)
         self.warn_box.setHtml(warn_html)
         self.warn_box.document().setDocumentMargin(2)
+        summary = summarize_warn_lines(lines)
+        self._warn_expanded = False
+        self.warn_toggle.setText(f"▶  {summary}")
+        self.warn_toggle.setVisible(True)
+        self.warn_box.hide()
 
         self.channel_table.set_records(records, deep)
         self.channel_table.set_result_actions_enabled(True)
+        self._sync_result_chrome()
         self.refresh_results_window()
 
         issue_n = 0

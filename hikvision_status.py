@@ -44,13 +44,14 @@ __all__ = [
 
 
 def print_status(nvr: HikvisionNVR, *, verbose: bool = False, device_name: str = ""):
-    """采集并打印单台 NVR 状态（Rich 报告式布局）。"""
+    """采集并打印单台 NVR 状态（Rich 报告式布局）。返回统一结果 dict。"""
     from cli_report import collect_status, render_reports
 
     report = collect_status(nvr, device_name=device_name)
     if not report.get("info"):
         report["error"] = "无法获取设备信息，请检查 IP/账号/网络"
     render_reports([report], verbose=verbose)
+    return report
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -154,6 +155,8 @@ def nvr_from_args(args: argparse.Namespace, *, quiet: bool = False) -> Hikvision
         "password": getattr(args, "password", None) or "",
         "ssl": bool(getattr(args, "ssl", False)),
     }
+    busy_start = getattr(args, "busy_start", None)
+    busy_end = getattr(args, "busy_end", None)
     options = {
         "lookback": int(getattr(args, "lookback", None) or 60),
         "no_search": bool(getattr(args, "no_search", False)),
@@ -163,8 +166,9 @@ def nvr_from_args(args: argparse.Namespace, *, quiet: bool = False) -> Hikvision
         "av_workers": int(getattr(args, "av_workers", None) or 2),
         "av_limit": getattr(args, "av_limit", None),
         "silence_db": float(getattr(args, "silence_db", None) if getattr(args, "silence_db", None) is not None else -80.0),
-        "busy_start": int(getattr(args, "busy_start", None) or 10),
-        "busy_end": int(getattr(args, "busy_end", None) or 18),
+        # 0 是合法小时(午夜),不能用 or 兜底
+        "busy_start": 10 if busy_start is None else int(busy_start),
+        "busy_end": 18 if busy_end is None else int(busy_end),
         "busy_days_ago": int(getattr(args, "busy_days_ago", None) or 0),
         "av_save": bool(getattr(args, "av_save", False)),
         "av_save_root": getattr(args, "av_save_root", None),
@@ -173,14 +177,34 @@ def nvr_from_args(args: argparse.Namespace, *, quiet: bool = False) -> Hikvision
 
 
 def main():
+    """单机 CLI 入口。
+
+    退出码: 0=巡检成功且健康良好/警告; 1=巡检失败(连接错误等);
+    2=巡检成功但健康状态「严重」(便于 cron/监控脚本告警)。
+    """
     parser = build_arg_parser()
     args = parser.parse_args()
 
     if not args.ip or not args.password:
         parser.error("单机模式需要 -i/--ip 与 -w/--password；多设备请使用 ./nvr")
 
-    nvr = nvr_from_args(args)
-    print_status(nvr, verbose=bool(args.verbose))
+    try:
+        nvr = nvr_from_args(args)
+        try:
+            report = print_status(nvr, verbose=bool(args.verbose))
+        finally:
+            nvr.close()
+    except KeyboardInterrupt:
+        raise SystemExit(130)
+    except Exception as e:
+        print(f"巡检失败: {e}")
+        raise SystemExit(1)
+
+    if report.get("error"):
+        raise SystemExit(1)
+    if ((report.get("health") or {}).get("健康状态")) == "严重":
+        raise SystemExit(2)
+    raise SystemExit(0)
 
 
 if __name__ == "__main__":

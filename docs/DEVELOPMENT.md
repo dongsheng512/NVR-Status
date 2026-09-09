@@ -29,20 +29,20 @@ cam-gui/
 │   └── export_report.py     # CSV(utf-8-sig)/TXT 导出，无 Qt 依赖（GUI/CLI 共用）
 ├── ui/                      # PySide6 GUI
 │   ├── app.py               # QApplication 入口、全局字体、异常/崩溃日志钩子
-│   ├── main_window.py       # 主窗组装 + 协调（APP_VERSION = "2.0.0"）
+│   ├── main_window.py       # 主窗组装 + 协调（APP_VERSION = "2.2.0"）
 │   ├── panels/              # B1 拆分：left_panel / results_panel / log_panel
 │   ├── scan_worker.py       # 后台巡检线程（threading）+ Qt Signal
 │   ├── theme.py             # 调色板、QSS、亮/暗/跟随系统、下拉箭头 SVG
 │   └── widgets/
 │       ├── channel_table.py # QAbstractTableModel + QSortFilterProxyModel + QTableView
 │       ├── device_editor.py # 设备编辑对话框（IP/端口校验）
-│       ├── profile_bar.py   # 档案下拉 + 新建/另存/重命名/删除/导入/导出
+│       ├── profile_bar.py   # 档案下拉 + 新建 + 管理菜单（另存/重命名/删除/导入/导出）
 │       └── status_bar.py    # 状态点 + 文案 + 百分比 + 进度条
 ├── run_gui.py               # GUI 入口 → ui.app.main
 ├── NVRStatus.spec           # PyInstaller 规格（PySide6，excludes 未用 Qt 模块）
 ├── build/build_mac.sh       # macOS 构建
 ├── build/build_win.ps1      # Windows 构建
-└── pyproject.toml           # 2.0.0；PySide6~=6.8.0；[project.scripts] nvr-gui
+└── pyproject.toml           # 2.2.0；PySide6~=6.8.0；[project.scripts] nvr-gui
 ```
 
 ### 1.2 关键实现决策
@@ -88,7 +88,7 @@ cam-gui/
 ### 2.2 自动化测试（A4）
 
 ```bash
-QT_QPA_PLATFORM=offscreen uv run pytest   # 33 例：导出 / 通道筛选排序 / 覆盖解析 / lookback 换算 / 取消 / 节流
+QT_QPA_PLATFORM=offscreen uv run pytest   # 96 例：导出 / 通道筛选排序 / 覆盖解析 / lookback 换算 / 取消 / 节流 / 档案条 / 空闲布局 / 2026-09 回归
 ```
 
 用例位于 `tests/`，非 Qt 用例无需 QApplication；Qt 用例用 `tests/conftest.py` 的 session 级 `qapp` 夹具（offscreen）。
@@ -98,7 +98,7 @@ QT_QPA_PLATFORM=offscreen uv run pytest   # 33 例：导出 / 通道筛选排序
 | 项 | 状态 | 说明 |
 |----|------|------|
 | **真机 NVR 验收** | 待做 | 阶段 1 关卡；跑一次完整快速/深度巡检，核对进度文案与结果区 |
-| **PyInstaller 打包验收** | 部分 | macOS 已构建；体积优化后 full ~172MB / lite ~74MB（zip 72/29MB）；Win 待目标机验收 |
+| **PyInstaller 打包验收** | 部分 | 2.2.0 macOS 已构建（full ~149MB / zip ~61MB，Info.plist 2.2.0、新监控图标、内置 ffmpeg 8.1.2、cocoa 启动冒烟通过；build_mac.sh 已固化 ffmpeg 覆盖后的整体重签名）；Win 待目标机验收 |
 
 ---
 
@@ -148,9 +148,9 @@ uv sync && uv run nvr-gui        # 与 uv run python run_gui.py 等价
 
 ## 4. 后续优化方向
 
-> **完整优化计划（评估 + 分阶段任务 + 架构演进 + 看板）已整理至：**  
-> **[optimization/OPTIMIZATION-PLAN.md](optimization/OPTIMIZATION-PLAN.md)**  
-> 以下为摘要；执行以 optimization 文档为准。
+> 历史上曾有 `optimization/OPTIMIZATION-PLAN.md`（未入库，已遗失）；
+> 2026-09 已按一次全面代码审查修复了其中的高/中优先级项（见 §6 修订记录）。
+> 以下为剩余方向摘要。
 
 ### 4.1 发布前必做（v2.0.0 阻塞）
 
@@ -222,3 +222,6 @@ powershell -ExecutionPolicy Bypass -File build\build_win.ps1   # Windows 打包
 | 2026-08 | 阶段 A 落地：A1 信号节流、A4 pytest 33 例、A5 主题重绘预警、A6 nvr-gui 可装 + gui_app 标注 legacy、A7 密码风险文档 |
 | 2026-08 | 阶段 B 落地：B1 拆 main_window → ui/panels/；B2 拆 hikvision_status → nvr_core/；B3 scan_runner 共用；B8 最小窗+详情单例；B4 删除 gui_app.py（CTk 遗留）；B5 多设备队列巡检；B6 历史报告归档；B7 凭证 keyring（macOS Keychain / Windows CM），阶段 B 收官 |
 | 2026-08-05 | 除虫收尾：Windows 多设备凭证 TargetName、keyring 写失败不丢密、档案 rename/delete/clone/删设备凭证生命周期、队列失败归档、pyproject 补包、文档同步 B7；pytest 55 例全绿 |
+| 2026-09-06 | **应用图标重绘**：`scripts/make_icon.py` 以 QPainter 矢量绘制监控主题图标（CCTV 枪机 + 支架 + 绿色状态灯 + 信号弧，深蓝底板），一键重建 `assets/AppIcon.iconset/` → `AppIcon.icns`（iconutil）、`app_logo.png`（窗口图标）与 `AppIcon.ico`（Windows，此前 spec 引用但缺失）。改图标只需改脚本再运行 `uv run python scripts/make_icon.py` |
+| 2026-09-06 | 全面代码审查与修复（pytest 84 例全绿）。**UI**：修复跟随系统主题深浅反转（`Qt.ColorScheme` 枚举误用）、日志超 5000 行后新日志被挤成一行、大窗提示标签主题残留、状态栏死代码、`_open_path` 改 Popen 不阻塞 UI、关窗时有界 join 巡检线程、结束的 worker `deleteLater` 回收、历史列表后台线程加载、qt.log 5MB 轮转。**nvr_core**：并发阶段（CMSearch/深度抽检）真正可取消（worker 检查点 + `cancel_futures` + ffmpeg `Popen` 取消即 kill）；ffmpeg stderr 中的 RTSP 凭据掩码后才进报告；`Session.close()` 逐台回收；瞬时网络失败不再负缓存；设备时区仅成功时缓存；`get_cameras` 结果缓存（每台省 4 次请求）；`_get/_post` 失败经回调进 GUI 日志；SSL 模式首次请求提示跳过证书校验（`disable_warnings` 收敛到 SSL 会话）；`search_workers` 上限 16；未配置录像的通道不再发 CMSearch；无时区设备时间按设备时区解释（修复停录误报正常）；`freeSpace` 缺失不再伪造 100% 满盘；健康判定大小写不敏感且不算「未知」为异常盘；`silence_db=0`/`busy_start=0` 不再被吞成默认值；单台设备配置异常不再中止队列；CLI 单机退出码（0 成功/1 失败/2 健康「严重」）。**安全/存储**：profiles.json 原子写入（mkstemp + os.replace）且 JSON 损坏时先留档再重置、读取占用时不覆盖；档案导出临时文件+POSIX 0o600+GUI 明文密码警示；CSV 公式注入防护；keyring `security` 调用捕获 `TimeoutExpired`（Keychain 授权框不再令启动崩溃）；设备 XML 拒绝 DOCTYPE/ENTITY 与超大响应；历史报告文件名碰撞与 `_prune` 竞态修复；pyproject 移除占位 `main` 模块、spec 清理 PyInstaller 6 废弃参数 |
+| 2026-09-09 | **v2.2.0**：档案条改为「新建 + 管理」；左侧重排；空闲/结果布局压缩（日志可折叠、预警一行摘要、通道表优先、完成后隐藏进度）；macOS 透明标题栏与窗口拖动、亮/暗双层画布；pytest 96 例；macOS arm64 完整包发布 GitHub Release |

@@ -23,16 +23,23 @@ class StorageMixin:
         drives = []
         for hdd in root.findall(".//hdd"):
             capacity = _to_int(hdd.findtext('capacity'))
-            free_space = _to_int(hdd.findtext('freeSpace'))
-            used_space = capacity - free_space
-            usage_rate = (used_space / capacity * 100) if capacity > 0 else 0
+            free_raw = hdd.findtext('freeSpace')
+            free_space = _to_int(free_raw)
+            if capacity > 0 and free_raw is not None and str(free_raw).strip():
+                used_space = capacity - free_space
+                usage_rate = (used_space / capacity * 100) if capacity > 0 else 0
+                usage_txt = f"{usage_rate:.1f}%"
+            else:
+                # 容量/剩余缺失时不要伪造 100% 满盘(会连锁误报「硬盘已满」)
+                used_space = 0
+                usage_txt = "未知"
 
             drive = {
                 "盘符": hdd.findtext("hddName", "未知"),
-                "容量TB": f"{capacity / 1024 / 1024:.1f}",
-                "剩余空间TB": f"{free_space / 1024 / 1024:.1f}",
-                "已用空间TB": f"{used_space / 1024 / 1024:.1f}",
-                "使用率": f"{usage_rate:.1f}%",
+                "容量TB": f"{capacity / 1024 / 1024:.1f}" if capacity > 0 else "未知",
+                "剩余空间TB": f"{free_space / 1024 / 1024:.1f}" if (free_raw or "").strip() else "未知",
+                "已用空间TB": f"{used_space / 1024 / 1024:.1f}" if capacity > 0 and (free_raw or "").strip() else "未知",
+                "使用率": usage_txt,
                 "状态": hdd.findtext("status", "未知"),
                 "类型": hdd.findtext("hddType", "未知"),
                 "属性": hdd.findtext("property", "未知"),

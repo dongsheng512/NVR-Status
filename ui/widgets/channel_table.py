@@ -245,13 +245,17 @@ class ChannelTableView(QWidget):
         super().__init__(parent)
         self._deep = False
         self._dark = False
+        self._show_result_actions = show_result_actions
 
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(6)
 
         # 同一行：计数 | 拉伸 | 仅异常 仅离线 | 导出结果 大窗显示
-        toolbar = QHBoxLayout()
+        # 无通道时整行隐藏，避免空态堆一排禁用按钮
+        self.toolbar_host = QWidget()
+        toolbar = QHBoxLayout(self.toolbar_host)
+        toolbar.setContentsMargins(0, 0, 0, 0)
         toolbar.setSpacing(8)
         self.count_label = QLabel("通道 0 路")
         self.count_label.setStyleSheet("color: " + theme.ui_color("muted", False) + ";")
@@ -284,7 +288,7 @@ class ChannelTableView(QWidget):
         else:
             self.btn_export.hide()
             self.btn_expand.hide()
-        root.addLayout(toolbar)
+        root.addWidget(self.toolbar_host)
 
         self.model = ChannelTableModel(self)
         self.proxy = ChannelFilterProxy(self)
@@ -311,9 +315,7 @@ class ChannelTableView(QWidget):
 
         self.stack = QStackedWidget()
         self.stack.addWidget(self.view)
-        self.placeholder = QLabel(
-            "尚未扫描 — 配置设备后点击「快速巡检」或「深度巡检」"
-        )
+        self.placeholder = QLabel("暂无通道数据")
         self.placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.placeholder.setWordWrap(True)
         self.placeholder.setStyleSheet(
@@ -336,6 +338,7 @@ class ChannelTableView(QWidget):
     def _sync_stack(self) -> None:
         empty = self.model.rowCount() == 0
         self.stack.setCurrentWidget(self.placeholder if empty else self.view)
+        self.toolbar_host.setVisible(not empty)
 
     def set_records(self, records: Optional[List[Dict[str, Any]]], deep: bool) -> None:
         self._deep = bool(deep)

@@ -45,9 +45,14 @@ class HealthMixin:
         ow_enabled = overwrite.get("enabled")  # True / False / None
         ow_label = overwrite.get("label") or "未知"
 
-        bad_drives = [
-            d for d in drives if d.get("状态") not in ("ok", "sleep", "idle")
-        ]
+        def _drive_bad(d: Dict) -> bool:
+            # 状态缺失/未知不计为异常(与 storage 推断逻辑一致);ok/normal/sleep/idle 均正常
+            st = str(d.get("状态") or "").strip().lower()
+            return bool(st) and st not in (
+                "ok", "normal", "sleep", "idle", "未知", "unknown",
+            )
+
+        bad_drives = [d for d in drives if _drive_bad(d)]
         if bad_drives:
             raise_to("严重")
             health["预警信息"].append(f"{len(bad_drives)}块硬盘状态异常")

@@ -70,12 +70,16 @@ def get_password(profile: str, device: Dict[str, object]) -> str:
 def delete_password(profile: str, device: Dict[str, object]) -> None:
     account = _account(profile, device)
     if sys.platform == "darwin":
-        subprocess.run(
-            ["security", "delete-generic-password", "-s", SERVICE, "-a", account],
-            capture_output=True,
-            text=True,
-            timeout=15,
-        )
+        try:
+            subprocess.run(
+                ["security", "delete-generic-password", "-s", SERVICE, "-a", account],
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+        except subprocess.TimeoutExpired:
+            # Keychain 授权框可能阻塞 security;删除失败不影响主流程
+            pass
     elif sys.platform == "win32":
         _win_delete_password(account)
 
@@ -94,35 +98,43 @@ def rekey_password(old_profile: str, new_profile: str, device: Dict[str, object]
 # ---- macOS: security CLI ----
 
 def _macos_set_password(account: str, password: str) -> bool:
-    proc = subprocess.run(
-        [
-            "/usr/bin/security",
-            "add-generic-password",
-            "-U",
-            "-s", SERVICE,
-            "-a", account,
-            "-w", password,
-        ],
-        capture_output=True,
-        text=True,
-        timeout=15,
-    )
+    try:
+        proc = subprocess.run(
+            [
+                "/usr/bin/security",
+                "add-generic-password",
+                "-U",
+                "-s", SERVICE,
+                "-a", account,
+                "-w", password,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    except subprocess.TimeoutExpired:
+        # Keychain ACL 授权框未响应时 security 会卡住:视为写入失败,
+        # 调用方回退明文保存,绝不能让 GUI 启动崩溃
+        return False
     return proc.returncode == 0
 
 
 def _macos_get_password(account: str) -> str:
-    proc = subprocess.run(
-        [
-            "/usr/bin/security",
-            "find-generic-password",
-            "-s", SERVICE,
-            "-a", account,
-            "-w",
-        ],
-        capture_output=True,
-        text=True,
-        timeout=15,
-    )
+    try:
+        proc = subprocess.run(
+            [
+                "/usr/bin/security",
+                "find-generic-password",
+                "-s", SERVICE,
+                "-a", account,
+                "-w",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    except subprocess.TimeoutExpired:
+        return ""
     if proc.returncode != 0:
         return ""
     return proc.stdout.rstrip("\r\n\x00")

@@ -75,6 +75,10 @@ def build_nvr(
 
     av_limit = opt.get("av_limit") or 0
     save_root = (opt.get("av_save_root") or "").strip() or default_save_root
+    # silence_db=0 / busy_start=0 是合法值,不能用 or 兜底(会被吞成默认)
+    silence_db = opt.get("silence_db")
+    busy_start = opt.get("busy_start")
+    busy_end = opt.get("busy_end")
     return HikvisionNVR(
         ip=device["ip"],
         port=int(device.get("port") or 80),
@@ -88,9 +92,9 @@ def build_nvr(
         av_seconds=int(opt.get("av_seconds") or 6),
         av_workers=int(opt.get("av_workers") or 2),
         av_limit=int(av_limit) if av_limit and int(av_limit) > 0 else None,
-        silence_db=float(opt.get("silence_db") or -80),
-        busy_start_hour=int(opt.get("busy_start") or 10),
-        busy_end_hour=int(opt.get("busy_end") or 18),
+        silence_db=-80.0 if silence_db is None else float(silence_db),
+        busy_start_hour=10 if busy_start is None else int(busy_start),
+        busy_end_hour=18 if busy_end is None else int(busy_end),
         busy_days_ago=busy_days_ago,
         av_save=want_save,
         av_save_root=save_root,
@@ -182,10 +186,13 @@ def run_nvr(
     }
 
 
-def _error_report(nvr: HikvisionNVR, *, device_name: str, error: str) -> Dict[str, Any]:
+def _error_report(
+    nvr: Optional[HikvisionNVR], *, device_name: str, error: str
+) -> Dict[str, Any]:
+    ip = getattr(nvr, "ip", "") or ""
     return {
-        "device_name": device_name or nvr.ip,
-        "ip": nvr.ip,
+        "device_name": device_name or ip,
+        "ip": ip,
         "info": {},
         "sys_status": {},
         "health": {},
@@ -194,16 +201,16 @@ def _error_report(nvr: HikvisionNVR, *, device_name: str, error: str) -> Dict[st
         "records": [],
         "drives": [],
         "disk_overwrite": {},
-        "lookback_minutes": nvr.lookback_minutes,
-        "deep_av_check": nvr.deep_av_check,
-        "deep_av": nvr.deep_av_check,
-        "av_seconds": nvr.av_seconds,
-        "av_workers": nvr.av_workers,
-        "busy_start_hour": nvr.busy_start_hour,
-        "busy_end_hour": nvr.busy_end_hour,
-        "av_save": nvr.av_save,
-        "av_save_dir": nvr.av_save_dir,
-        "check_disk_recording": nvr.check_disk_recording,
+        "lookback_minutes": getattr(nvr, "lookback_minutes", 0) or 0,
+        "deep_av_check": bool(getattr(nvr, "deep_av_check", False)),
+        "deep_av": bool(getattr(nvr, "deep_av_check", False)),
+        "av_seconds": getattr(nvr, "av_seconds", 0) or 0,
+        "av_workers": getattr(nvr, "av_workers", 0) or 0,
+        "busy_start_hour": getattr(nvr, "busy_start_hour", 0) or 0,
+        "busy_end_hour": getattr(nvr, "busy_end_hour", 0) or 0,
+        "av_save": bool(getattr(nvr, "av_save", False)),
+        "av_save_dir": getattr(nvr, "av_save_dir", None),
+        "check_disk_recording": bool(getattr(nvr, "check_disk_recording", True)),
         "error": error,
     }
 
@@ -225,7 +232,10 @@ def scan(
         progress_callback=progress_callback,
         default_save_root=default_save_root,
     )
-    return run_nvr(nvr, device_name=device_name, progress_callback=progress_callback)
+    try:
+        return run_nvr(nvr, device_name=device_name, progress_callback=progress_callback)
+    finally:
+        nvr.close()
 
 
 def scan_queue(
@@ -281,16 +291,31 @@ def scan_queue(
             except Exception:
                 pass
 
-        nvr = build_nvr(
-            dev,
-            options,
-            quiet=quiet,
-            progress_callback=_wrapped,
-            default_save_root=default_save_root,
-        )
-        if on_nvr is not None:
-            on_nvr(nvr)
-        report = run_nvr(nvr, device_name=name, progress_callback=_wrapped)
+        nvr = None
+        try:
+            nvr = build_nvr(
+                dev,
+                options,
+                quiet=quiet,
+                progress_callback=_wrapped,
+                default_save_root=default_save_root,
+            )
+            if on_nvr is not None:
+                on_nvr(nvr)
+            report = run_nvr(nvr, device_name=name, progress_callback=_wrapped)
+        except ScanCancelled:
+            raise
+        except Exception as e:
+            # 单台设备配置异常(如缺 IP)不应中止整个队列
+            report = _error_report(nvr, device_name=name, error=f"巡检异常: {e}")
+        finally:
+            # 防御式关闭:测试/调用方可能传入无 close 的替身对象
+            close = getattr(nvr, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:
+                    pass
         results.append(report)
         if on_device is not None:
             on_device(report)

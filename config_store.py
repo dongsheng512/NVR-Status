@@ -8,7 +8,10 @@ import os
 import re
 import shutil
 import sys
+import tempfile
+import time
 from copy import deepcopy
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 
@@ -109,20 +112,55 @@ class ConfigStore:
             self._try_migrate_legacy()
             self.save()
             return
+        raw: Any = None
+        read_failed = False
         try:
             with open(self.path, "r", encoding="utf-8") as f:
                 raw = json.load(f)
-            if not isinstance(raw, dict) or "profiles" not in raw:
-                raise ValueError("invalid profiles format")
-            self.data = raw
-            if not self.data.get("profiles"):
-                self.data = _default_store()
-            if self.data.get("active_profile") not in self.data["profiles"]:
-                self.data["active_profile"] = next(iter(self.data["profiles"]))
+        except OSError:
+            # 文件被占用/权限问题(杀毒、同步盘):保留原文件,不覆盖,
+            # 本次会话用默认数据,后续 save 由调用方按需触发
+            read_failed = True
         except Exception:
+            raw = None
+        if read_failed:
+            self.data = _default_store()
+            self._try_migrate_legacy()
+            return
+        if not isinstance(raw, dict) or "profiles" not in raw:
+            # JSON 损坏:先把坏文件留档再重置,避免用户档案被静默清掉
+            self._backup_corrupt()
             self.data = _default_store()
             self._try_migrate_legacy()
             self.save()
+            return
+        self.data = raw
+        if not self.data.get("profiles"):
+            self.data = _default_store()
+        if self.data.get("active_profile") not in self.data["profiles"]:
+            self.data["active_profile"] = next(iter(self.data["profiles"]))
+
+    def _backup_corrupt(self) -> None:
+        """把损坏的 profiles.json 改名留档(最多保留 3 份)。"""
+        try:
+            stamp = time.strftime("%Y%m%d-%H%M%S")
+            dst = f"{self.path}.corrupt-{stamp}"
+            n = 1
+            while os.path.exists(dst):
+                dst = f"{self.path}.corrupt-{stamp}-{n}"
+                n += 1
+            shutil.move(self.path, dst)
+            # 清理更早的留档
+            import glob
+
+            olds = sorted(glob.glob(f"{self.path}.corrupt-*"))
+            for old in olds[:-3]:
+                try:
+                    os.unlink(old)
+                except OSError:
+                    pass
+        except OSError:
+            pass
 
     def _try_migrate_legacy(self) -> None:
         """若存在旧版 nvr_config.json,导入为「默认」档案。"""
@@ -154,11 +192,24 @@ class ConfigStore:
                 continue
 
     def save(self) -> None:
-        os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
-        tmp = self.path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(self.data, f, ensure_ascii=False, indent=2)
-        shutil.move(tmp, self.path)
+        """原子写入: 目标目录内建唯一临时文件,os.replace 原子替换。"""
+        # resolve() 规范化,拒绝含 .. 的路径分量
+        target = Path(self.path).expanduser().resolve()
+        if ".." in target.parts:
+            raise ValueError(f"非法配置路径: {self.path}")
+        parent = str(target.parent)
+        os.makedirs(parent, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(prefix=".profiles-", suffix=".tmp", dir=parent)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(self.data, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, target)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
 
     # ---- 档案操作 ----
 
@@ -253,6 +304,8 @@ class ConfigStore:
         ]
         if stale:
             self._purge_keyring(name, stale)
+        # 注意: 表单中留空密码=保留 keyring 旧条目(既有语义,有测试锁定);
+        # 仅被移除的设备才会清理凭证
         self._migrate_passwords(profile.get("devices") or [], name)
         self.data["profiles"][name] = profile
         self.save()
@@ -319,11 +372,27 @@ class ConfigStore:
         return True
 
     def export_profile(self, name: str, path: str) -> None:
-        # 导出含运行时密码（便于迁移到他机）；导入侧会再迁入 keyring
+        """导出档案为 JSON。
+
+        导出含运行时明文密码（便于迁移到他机）；导入侧会再迁入 keyring。
+        写入失败时清理半截文件,POSIX 下收紧文件权限(0o600)。
+        """
         prof = deepcopy(self.get_profile(name))
         prof["devices"] = self.resolve_devices(name)
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(prof, f, ensure_ascii=False, indent=2)
+        parent = os.path.dirname(os.path.abspath(path)) or "."
+        fd, tmp = tempfile.mkstemp(prefix=".nvr-export-", suffix=".tmp", dir=parent)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(prof, f, ensure_ascii=False, indent=2)
+            if os.name != "nt":
+                os.chmod(tmp, 0o600)
+            os.replace(tmp, path)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
 
     def import_profile(self, path: str, name: Optional[str] = None) -> str:
         with open(path, "r", encoding="utf-8") as f:

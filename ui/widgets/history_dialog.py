@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
@@ -27,9 +28,11 @@ class HistoryDialog(QDialog):
     """历史报告列表（B6）。
 
     信号：report_loaded(dict) — 用户点击「查看」时带完整结果发出，由主窗渲染。
+    列表加载在后台线程解析（几百份 JSON 不冻结 UI），经 _meta_loaded 队列回主线程。
     """
 
     report_loaded = Signal(object)
+    _meta_loaded = Signal(list)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -86,6 +89,7 @@ class HistoryDialog(QDialog):
         root.addLayout(btns)
 
         self._meta: List[Dict[str, Any]] = []
+        self._meta_loaded.connect(self._apply_meta)
         self._load()
 
     def set_dark(self, dark: bool) -> None:
@@ -94,7 +98,20 @@ class HistoryDialog(QDialog):
         self.tip_label.setStyleSheet(f"color: {muted}; font-size: 11px;")
 
     def _load(self) -> None:
-        self._meta = history.list_reports()
+        self.summary.setText("正在加载报告列表…")
+        self.btn_refresh.setEnabled(False)
+        threading.Thread(target=self._load_bg, daemon=True, name="history-list").start()
+
+    def _load_bg(self) -> None:
+        try:
+            meta = history.list_reports()
+        except Exception:
+            meta = []
+        self._meta_loaded.emit(meta)
+
+    def _apply_meta(self, meta: List[Dict[str, Any]]) -> None:
+        self.btn_refresh.setEnabled(True)
+        self._meta = list(meta or [])
         self.table.setRowCount(len(self._meta))
         for i, m in enumerate(self._meta):
             self.table.setItem(i, 0, QTableWidgetItem(m["saved_at"]))

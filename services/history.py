@@ -29,7 +29,9 @@ def history_dir() -> str:
 
 
 def _safe_name(name: str) -> str:
-    return re.sub(r"[^\w\u4e00-\u9fff-]+", "_", str(name or "NVR")).strip("_") or "NVR"
+    s = re.sub(r"[^\w\u4e00-\u9fff-]+", "_", str(name or "NVR")).strip("_") or "NVR"
+    # 截断,避免超长设备名在 Windows 触发 MAX_PATH 问题
+    return s[:60]
 
 
 def _json_default(obj: Any) -> Any:
@@ -70,6 +72,11 @@ def save_report(data: Dict[str, Any]) -> str:
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     name = _safe_name(data.get("device_name") or "NVR")
     path = os.path.join(history_dir(), f"{stamp}_{name}.json")
+    # 同一秒多次归档时追加序号,避免静默覆盖
+    n = 1
+    while os.path.exists(path):
+        path = os.path.join(history_dir(), f"{stamp}_{name}_{n}.json")
+        n += 1
     payload = dict(data or {})
     payload["saved_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     payload["_file"] = os.path.basename(path)
@@ -91,7 +98,15 @@ def _prune(directory: str) -> None:
         for fn in os.listdir(directory)
         if fn.endswith(".json")
     ]
-    files.sort(key=os.path.getmtime, reverse=True)
+
+    def _mtime(p: str) -> float:
+        # 文件可能被并发删除,竞争失败按 0 处理(会被优先清理)
+        try:
+            return os.path.getmtime(p)
+        except OSError:
+            return 0.0
+
+    files.sort(key=_mtime, reverse=True)
     for old in files[MAX_REPORTS:]:
         try:
             os.remove(old)

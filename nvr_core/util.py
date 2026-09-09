@@ -101,8 +101,13 @@ def _to_float(value: Optional[str], default: float = 0.0) -> float:
         return default
 
 
-def _parse_hik_time(value: Optional[str]) -> Optional[datetime]:
-    """解析海康时间字符串为 UTC aware datetime。"""
+def _parse_hik_time(value: Optional[str], tz=None) -> Optional[datetime]:
+    """解析海康时间字符串为 UTC aware datetime。
+
+    tz: 无时区数字串的基准时区(通常传设备时区)。设备按本地墙钟上报时,
+    按 UTC 解释会把 endTime 虚大数小时,导致停录数小时仍误报「正常」;
+    None 时保持旧行为按 UTC。
+    """
     if not value:
         return None
     text = value.strip()
@@ -111,8 +116,10 @@ def _parse_hik_time(value: Optional[str]) -> Optional[datetime]:
             return datetime.fromisoformat(text.replace("Z", "+00:00"))
         if re.search(r"[+-]\d{2}:\d{2}$", text):
             return datetime.fromisoformat(text).astimezone(timezone.utc)
-        # 无时区时按设备本地难以确定,按 UTC 解释
-        return datetime.fromisoformat(text).replace(tzinfo=timezone.utc)
+        # 无时区:设备本地墙钟(与写侧 _fmt_rtsp_time 约定一致)
+        return datetime.fromisoformat(text).replace(
+            tzinfo=tz or timezone.utc
+        ).astimezone(timezone.utc)
     except ValueError:
         return None
 

@@ -11,18 +11,30 @@ import re
 import shutil
 import subprocess
 import tempfile
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import quote
 
-from nvr_core.util import _safe_filename
+from nvr_core.util import ScanCancelled, _safe_filename
 
 
 class AVProbeMixin:
     # RTSP 时间串: 海康 playbackURI 里 Z 后缀在不同固件上既可能表示
     # 真 UTC, 也可能表示设备本地墙钟(数字是本地时,后缀仍写 Z)。
     # 写侧默认用本地墙钟(_fmt_rtsp_time); 读侧需与 CMSearch 段时间对齐判定。
+
+    def _mask_credentials(self, text: str) -> str:
+        """掩去错误信息里的 rtsp user:pass(避免进入报告/历史文件)。"""
+        if not text:
+            return text
+        # 明文形态 rtsp://user:pass@host 与 URL 编码形态 user%3Apwd@
+        masked = re.sub(r"(://)([^@/\s:]+):([^@/\s]+)@", r"\1***:***@", text)
+        masked = re.sub(
+            r"(://)([^@/\s%]+)%3A([^@/\s]+)@", r"\1***:***@", masked, flags=re.I
+        )
+        return masked
 
     def _inject_rtsp_auth(self, uri: str) -> str:
         """向 rtsp:// 注入 user:pass@；已有 userinfo 则替换。"""
@@ -303,6 +315,41 @@ class AVProbeMixin:
         except OSError:
             return None
 
+    def _run_cancellable(
+        self, cmd: List[str], timeout: float
+    ) -> subprocess.CompletedProcess:
+        """subprocess.run 的可取消版: 巡检取消时立即 kill 子进程。
+
+        用于 ffmpeg 拉流(单路最长 av_seconds+30s),否则点「取消」后
+        仍要等正在拉流的各路跑完才真正停止。
+        """
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+        )
+        deadline = time.monotonic() + timeout
+        try:
+            while True:
+                try:
+                    out, err = proc.communicate(timeout=0.25)
+                    return subprocess.CompletedProcess(cmd, proc.returncode, out, err)
+                except subprocess.TimeoutExpired:
+                    pass
+                if self._cancelled.is_set():
+                    proc.kill()
+                    proc.communicate()
+                    raise ScanCancelled("巡检已取消")
+                if time.monotonic() >= deadline:
+                    proc.kill()
+                    proc.communicate()
+                    raise subprocess.TimeoutExpired(cmd, timeout)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                try:
+                    proc.communicate(timeout=2)
+                except Exception:
+                    pass
+
     def _probe_track_av(
         self,
         track_id: str,
@@ -382,6 +429,7 @@ class AVProbeMixin:
             min_ok = 8 * 1024
             partial_ok = 24 * 1024
             for label, rtsp in ordered:
+                self._check_cancel()
                 if os.path.exists(tmp_path):
                     try:
                         os.truncate(tmp_path, 0)
@@ -406,9 +454,7 @@ class AVProbeMixin:
                     tmp_path,
                 ]
                 try:
-                    proc = subprocess.run(
-                        cmd, capture_output=True, text=True, timeout=timeout
-                    )
+                    proc = self._run_cancellable(cmd, timeout=timeout)
                     size = os.path.getsize(tmp_path) if os.path.exists(tmp_path) else 0
                     if size >= min_ok and (
                         proc.returncode == 0 or size >= partial_ok
@@ -441,7 +487,7 @@ class AVProbeMixin:
                     hint = "；鉴权失败，请核对账号密码"
                 elif "404" in low:
                     hint = "；回放资源不存在，通道可能无该时段录像"
-                result["抽检详情"] = f"短时拉流失败({last_err[:100]}){hint}"
+                result["抽检详情"] = f"短时拉流失败({self._mask_credentials(last_err)[:100]}){hint}"
                 return result
             probe_cmd = [
                 ffprobe, "-v", "error",
@@ -547,6 +593,9 @@ class AVProbeMixin:
                     )
 
             return result
+        except ScanCancelled:
+            # 取消必须向上传播,不能被下面的兜底 except 吞成结果
+            raise
         except subprocess.TimeoutExpired:
             result["视频抽检"] = "异常"
             result["音频抽检"] = "未知"
@@ -555,7 +604,7 @@ class AVProbeMixin:
         except Exception as e:
             result["视频抽检"] = "未知"
             result["音频抽检"] = "未知"
-            result["抽检详情"] = f"抽检异常: {e}"
+            result["抽检详情"] = f"抽检异常: {self._mask_credentials(str(e))}"
             return result
         finally:
             if tmp_path:
@@ -597,7 +646,13 @@ class AVProbeMixin:
                     r["抽检详情"] = "跳过"
 
         if self.av_limit is not None:
+            overflow = candidates[self.av_limit:]
             candidates = candidates[: self.av_limit]
+            # 被截掉的通道补打标记,避免残留「未启用深度抽检」误导
+            for r in overflow:
+                r["视频抽检"] = "跳过"
+                r["音频抽检"] = "跳过"
+                r["抽检详情"] = f"超出抽检路数上限({self.av_limit})"
 
         if not candidates:
             self._log("深度抽检: 无可用通道(需近期有录像)")
@@ -614,6 +669,7 @@ class AVProbeMixin:
             self._log(f"片段保存目录: {save_dir}")
 
         def _job(rec: Dict) -> Tuple[str, Dict]:
+            self._check_cancel()
             tid = str(rec["track_id"])
             # 在繁忙时段窗口检索回放URI
             found = self._search_track_in_range(tid, clip_s, clip_e)
@@ -652,7 +708,8 @@ class AVProbeMixin:
         done_av = 0
         # 深度抽检约占总进度 70%→96%
         deep_lo, deep_hi = 0.70, 0.96
-        with ThreadPoolExecutor(max_workers=self.av_workers) as pool:
+        pool = ThreadPoolExecutor(max_workers=self.av_workers)
+        try:
             futs = [pool.submit(_job, r) for r in candidates]
             for fut in as_completed(futs):
                 tid, res = fut.result()
@@ -673,6 +730,14 @@ class AVProbeMixin:
                         phase="deep",
                         overall=overall,
                     )
+        except ScanCancelled:
+            # 排队任务立即撤号;正在拉流的路由 _run_cancellable kill ffmpeg
+            pool.shutdown(wait=False, cancel_futures=True)
+            raise
+        except BaseException:
+            pool.shutdown(wait=False, cancel_futures=True)
+            raise
+        pool.shutdown(wait=True)
 
         saved_n = 0
         for r in candidates:

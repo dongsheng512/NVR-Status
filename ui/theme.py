@@ -6,8 +6,9 @@ import os
 import sys
 import tempfile
 from enum import Enum
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
+from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor, QFont, QGuiApplication, QPalette
 from PySide6.QtWidgets import QApplication
 
@@ -49,22 +50,32 @@ STATE_DOT: Dict[str, Tuple[str, str]] = {
     "error": ("#dc2626", "#ef4444"),
 }
 
-# 表格斑马纹背景
-ZEBRA_ODD = {"light": "#f6f8fa", "dark": "#2e2e2e"}
-ZEBRA_EVEN = {"light": "#ffffff", "dark": "#242424"}
+# 只保留两层：画布 + 卡片。色相统一走中性灰（对齐 macOS grouped）
+CANVAS_BG = {"light": "#F5F5F7", "dark": "#1C1C1E"}
+PANEL_BG = {"light": "#FFFFFF", "dark": "#2C2C2E"}
+PANEL_ALT = {"light": "#F2F2F7", "dark": "#1C1C1E"}
+BORDER = {"light": "#D1D1D6", "dark": "#3A3A3C"}
+BTN_BG = {"light": "#E5E5EA", "dark": "#3A3A3C"}
+BTN_HOVER = {"light": "#D8D8DE", "dark": "#48484A"}
+BTN_PRESSED = {"light": "#C7C7CC", "dark": "#2C2C2E"}
 
-# 日志区/表格区背景
-PANEL_BG = {"light": "#ffffff", "dark": "#242424"}
-PANEL_ALT = {"light": "#f6f8fa", "dark": "#1a1a1a"}
-BORDER = {"light": "#d0d7de", "dark": "#3a3a3a"}
+# 表格斑马纹
+ZEBRA_ODD = {"light": "#F2F2F7", "dark": "#2C2C2E"}
+ZEBRA_EVEN = {"light": "#FFFFFF", "dark": "#3A3A3C"}
 
-# 文本色
-TEXT_PRIMARY = {"light": "#1f2328", "dark": "#e6e6e6"}
-TEXT_SECONDARY = {"light": "#6e7781", "dark": "#9aa4b2"}
+TEXT_PRIMARY = {"light": "#1C1C1E", "dark": "#F2F2F7"}
+TEXT_SECONDARY = {"light": "#8E8E93", "dark": "#98989D"}
 
 
 def ui_color(key: str, dark: bool) -> str:
     return (STATUS_COLORS[key]["dark"] if dark else STATUS_COLORS[key]["light"])
+
+
+def canvas_hex(dark: Optional[bool] = None) -> str:
+    """当前窗口画布色（标题栏 / 侧栏 / 状态栏）。"""
+    if dark is None:
+        dark = effective_dark()
+    return CANVAS_BG["dark" if dark else "light"]
 
 
 _CHEVRON_CACHE: Dict[str, str] = {}
@@ -125,7 +136,7 @@ def effective_dark() -> bool:
     if _CURRENT_MODE == ThemeMode.LIGHT:
         return False
     scheme = QGuiApplication.styleHints().colorScheme()
-    return scheme.value == 1  # Qt.ColorScheme.Dark
+    return scheme == Qt.ColorScheme.Dark
 
 
 def apply_theme(app: QApplication, mode: ThemeMode) -> None:
@@ -135,7 +146,7 @@ def apply_theme(app: QApplication, mode: ThemeMode) -> None:
     dark = effective_dark()
     pal = QPalette()
 
-    bg = "#1e1f22" if dark else "#f5f6f8"
+    bg = canvas_hex(dark)
     panel = PANEL_BG["dark" if dark else "light"]
     border = BORDER["dark" if dark else "light"]
     text = TEXT_PRIMARY["dark" if dark else "light"]
@@ -149,7 +160,7 @@ def apply_theme(app: QApplication, mode: ThemeMode) -> None:
     pal.setColor(QPalette.ColorRole.WindowText, _C(text))
     pal.setColor(QPalette.ColorRole.Text, _C(text))
     pal.setColor(QPalette.ColorRole.PlaceholderText, _C(text_sec))
-    pal.setColor(QPalette.ColorRole.Button, _C(bg))
+    pal.setColor(QPalette.ColorRole.Button, _C(BTN_BG["dark" if dark else "light"]))
     pal.setColor(QPalette.ColorRole.ButtonText, _C(text))
     pal.setColor(QPalette.ColorRole.Highlight, _C("#3b82f6"))
     pal.setColor(QPalette.ColorRole.HighlightedText, _C("#ffffff"))
@@ -161,25 +172,26 @@ def apply_theme(app: QApplication, mode: ThemeMode) -> None:
 
     app.setPalette(pal)
 
-    btn_bg = "#3a3d42" if dark else "#eef1f4"
-    btn_hover = "#464a50" if dark else "#e2e6ea"
-    btn_pressed = "#2c2f33" if dark else "#d5dade"
+    btn_bg = BTN_BG["dark" if dark else "light"]
+    btn_hover = BTN_HOVER["dark" if dark else "light"]
+    btn_pressed = BTN_PRESSED["dark" if dark else "light"]
     border_c = border
-    group_hint = "#1e3a5f" if dark else "#eff6ff"
-    select_bg = "#1e3a5f" if dark else "#dbe9ff"
+    group_hint = "#1e3a5f" if dark else "#EEF2FF"
+    select_bg = "#1e3a5f" if dark else "#E8EEFF"
     arrow = _chevron_path(dark)
     arrow_up = _chevron_path(dark, direction="up")
     arrow_disabled = _chevron_path(dark, disabled=True)
 
-    toggle_bg = "#1e3a5f" if dark else "#e8f1fd"
-    toggle_hover = "#2a4a78" if dark else "#dbe9ff"
-    toggle_pressed = "#18324e" if dark else "#c9deff"
-    toggle_fg = "#79b8ff" if dark else "#1d4ed8"
-    toggle_border = "#2d6eb8" if dark else "#9dc4ff"
-
     qss = f"""
-    QMainWindow, QDialog {{ background: {bg}; }}
+    QMainWindow, QDialog,
+    QWidget#WindowCanvas, QSplitter#MainSplit, QSplitter#RightSplit,
+    QWidget#MacChromeBar, QWidget#AppStatusBar,
+    QScrollArea#LeftScroll, QWidget#LeftScrollBody {{
+        background-color: {bg};
+    }}
     QWidget {{ color: {text}; font-size: 13px; }}
+    QSplitter {{ background-color: {bg}; }}
+    QWidget#AppStatusBar {{ background-color: {bg}; }}
 
     QFrame#Card, QGroupBox {{
         background: {panel};
@@ -271,6 +283,18 @@ def apply_theme(app: QApplication, mode: ThemeMode) -> None:
     QPushButton:focus {{
         border: 1px solid #3b82f6;
     }}
+    /* 档案「管理」：与「新建」同高，右侧给 chevron 留位 */
+    QPushButton#ProfileManageBtn {{
+        padding: 6px 22px 6px 12px;
+    }}
+    QPushButton#ProfileManageBtn::menu-indicator {{
+        image: url({arrow});
+        width: 12px;
+        height: 8px;
+        subcontrol-origin: padding;
+        subcontrol-position: right center;
+        right: 8px;
+    }}
     QPushButton#FormField {{
         border-radius: 4px;
         padding: 2px 8px;
@@ -348,12 +372,12 @@ def apply_theme(app: QApplication, mode: ThemeMode) -> None:
     QPushButton[role="danger"]:hover {{ background: #991b1b; }}
 
     QPushButton[role="toggle"] {{
-        background: {toggle_bg}; color: {toggle_fg};
-        border: 1px solid {toggle_border}; border-radius: 6px;
+        background: {panel}; color: {text};
+        border: 1px solid {border_c}; border-radius: 6px;
         padding: 6px 12px; font-weight: 600; text-align: left;
     }}
-    QPushButton[role="toggle"]:hover {{ background: {toggle_hover}; }}
-    QPushButton[role="toggle"]:pressed {{ background: {toggle_pressed}; }}
+    QPushButton[role="toggle"]:hover {{ background: {btn_hover}; }}
+    QPushButton[role="toggle"]:pressed {{ background: {btn_pressed}; }}
 
     QPlainTextEdit, QTextEdit {{
         background: {panel};
@@ -415,6 +439,11 @@ def apply_theme(app: QApplication, mode: ThemeMode) -> None:
         color: {text};
     }}
 
+    QComboBox#ProfileCombo {{
+        padding: 4px 26px 4px 8px;
+        min-height: 24px;
+    }}
+
     /* 扫描目标：选项间距相对默认 +1px */
     QComboBox#ScanTargetCombo {{
         padding: 4px 26px 4px 8px;
@@ -450,7 +479,9 @@ def apply_theme(app: QApplication, mode: ThemeMode) -> None:
     }}
     QProgressBar::chunk {{ background: #3b82f6; border-radius: 5px; }}
 
-    QScrollArea {{ border: none; background: transparent; }}
+    QScrollArea {{ border: none; background-color: {bg}; }}
+    QScrollArea#LeftScroll {{ background-color: {bg}; border: none; }}
+    QWidget#LeftScrollBody {{ background-color: {bg}; }}
     QScrollBar:vertical {{ background: transparent; width: 10px; margin: 0; }}
     QScrollBar::handle:vertical {{ background: {text_sec}; border-radius: 5px; min-height: 30px; }}
     QScrollBar::handle:vertical:hover {{ background: {text}; }}
@@ -467,9 +498,36 @@ def apply_theme(app: QApplication, mode: ThemeMode) -> None:
     QSplitter::handle {{ background: transparent; }}
     QSplitter::handle:hover {{ background: #3b82f6; }}
 
-    QMenu {{ background: {panel}; border: 1px solid {border_c}; }}
+    QWidget#MacChromeBar {{
+        background-color: {bg};
+        border: none;
+    }}
+
+    QMenu {{
+        background: {panel};
+        border: 1px solid {border_c};
+        border-radius: 8px;
+        padding: 4px;
+    }}
     QMenu::item {{ padding: 6px 24px; }}
     QMenu::item:selected {{ background: #3b82f6; color: #ffffff; }}
+    QMenu::separator {{
+        height: 1px;
+        background: {border_c};
+        margin: 4px 8px;
+    }}
+    /* 档案管理菜单行由 _MenuItemRow 自绘悬停/危险色，去掉 item 内边距避免叠两层 */
+    QMenu#ProfileManageMenu::item {{
+        padding: 0px;
+        margin: 0px;
+        border: none;
+        background: transparent;
+    }}
+    QMenu#ProfileManageMenu::item:selected,
+    QMenu#ProfileManageMenu::item:hover {{
+        background: transparent;
+        color: {text};
+    }}
     """
     app.setStyleSheet(qss)
 

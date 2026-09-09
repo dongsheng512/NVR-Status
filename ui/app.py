@@ -23,7 +23,7 @@ def _set_qt_attrs() -> None:
     # 高 DPI 默认启用；设置组织/应用名便于 QSettings
     QCoreApplication.setOrganizationName("NVRStatus")
     QCoreApplication.setApplicationName("NVRStatus")
-    QCoreApplication.setApplicationVersion("2.0.0")
+    QCoreApplication.setApplicationVersion("2.2.0")
     try:
         QCoreApplication.setAttribute(Qt.ApplicationAttribute.AA_EnableHighDpiScaling, True)
     except Exception:
@@ -62,12 +62,20 @@ def _install_exception_hook() -> None:
 
 
 def _install_qt_message_hook() -> None:
-    """将 Qt 警告/错误写入 logs/qt.log，便于无 console 包诊断。"""
+    """将 Qt 警告/错误写入 logs/qt.log，便于无 console 包诊断。
+
+    文件超过 5MB 时轮转为 qt.log.old,避免无限增长。
+    """
     from PySide6.QtCore import qInstallMessageHandler  # type: ignore
 
     def handler(mode, context, message) -> None:
         try:
             path = os.path.join(_logs_dir(), "qt.log")
+            try:
+                if os.path.getsize(path) > 5 * 1024 * 1024:
+                    os.replace(path, path + ".old")
+            except OSError:
+                pass
             with open(path, "a", encoding="utf-8") as f:
                 f.write(f"[{datetime.now().isoformat()}] {mode} {message}\n")
         except Exception:
@@ -83,7 +91,7 @@ def main() -> None:
 
     app = QApplication(sys.argv)
     app.setApplicationName("NVRStatus")
-    app.setApplicationVersion("2.0.0")
+    app.setApplicationVersion("2.2.0")
 
     from ui import theme
     from ui.main_window import MainWindow

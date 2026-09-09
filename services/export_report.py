@@ -55,6 +55,27 @@ def _row_values(r: Dict[str, Any], deep: bool) -> List[str]:
     return row
 
 
+# Excel/WPS 会把以这些字符开头的单元格当公式执行(CSV 公式注入)
+_FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
+
+
+def _safe_cell(v: Any) -> Any:
+    """防 CSV 公式注入: 上述前缀的文本单元格加 ' 前缀。"""
+    if isinstance(v, str) and v.startswith(_FORMULA_PREFIXES):
+        return "'" + v
+    return v
+
+
+class _SafeWriter:
+    """csv.writer 包装: 每个单元格过 _safe_cell。"""
+
+    def __init__(self, f: Any):
+        self._w = csv.writer(f)
+
+    def writerow(self, row: List[Any]) -> None:
+        self._w.writerow([_safe_cell(c) for c in row])
+
+
 def export_csv(path: str, data: Dict[str, Any]) -> None:
     """导出 CSV(utf-8-sig，Excel 友好)。"""
     records = data.get("records") or []
@@ -64,7 +85,7 @@ def export_csv(path: str, data: Dict[str, Any]) -> None:
     info = data.get("info") or {}
 
     with open(path, "w", encoding="utf-8-sig", newline="") as f:
-        w = csv.writer(f)
+        w = _SafeWriter(f)
         w.writerow(["# NVR 巡检报告"])
         w.writerow(["导出时间", datetime.now().strftime("%Y-%m-%d %H:%M:%S")])
         w.writerow(["设备名称", data.get("device_name") or ""])

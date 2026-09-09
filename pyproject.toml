@@ -7,14 +7,13 @@ py-modules = [
     "cli_report",
     "config_store",
     "hikvision_status",
-    "main",
     "run_gui",
 ]
 packages = ["ui", "ui.panels", "ui.widgets", "services", "nvr_core"]
 
 [project]
 name = "cam"
-version = "2.0.0"
+version = "2.2.0"
 description = "海康 NVR 状态巡检与音视频抽检（CLI + GUI）"
 requires-python = ">=3.11"
 dependencies = [

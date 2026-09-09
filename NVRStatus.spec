@@ -14,7 +14,6 @@
 import os
 import sys
 
-block_cipher = None
 root = os.path.abspath('.')
 
 # ---- 是否捆绑 ffmpeg ----
@@ -231,9 +230,6 @@ a = Analysis(
     },
     runtime_hooks=[],
     excludes=excludes,
-    win_no_prefer_redirects=False,
-    win_private_assemblies=False,
-    cipher=block_cipher,
     noarchive=False,
 )
 
@@ -253,7 +249,7 @@ print(
     f'binaries={len(a.binaries)} datas={len(a.datas)}'
 )
 
-pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
+pyz = PYZ(a.pure, a.zipped_data)
 
 exe = EXE(
     pyz,
@@ -277,7 +273,6 @@ exe = EXE(
 coll = COLLECT(
     exe,
     a.binaries,
-    a.zipfiles,
     a.datas,
     strip=False,
     upx=False,
@@ -294,7 +289,7 @@ if sys.platform == 'darwin':
         bundle_identifier='com.local.nvrstatus',
         info_plist={
             'NSHighResolutionCapable': True,
-            'CFBundleShortVersionString': '2.0.0',
+            'CFBundleShortVersionString': '2.2.0',
             'CFBundleName': 'NVRStatus',
             'CFBundleDisplayName': 'NVR 状态巡检',
         },

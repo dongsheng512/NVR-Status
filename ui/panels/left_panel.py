@@ -1,4 +1,4 @@
-"""左侧配置面板：设备列表 + 扫描目标 + 扫描设置 + 巡检操作 + 主题。
+"""左侧配置面板：扫描目标 → 设备列表 → 开始巡检 → 扫描设置 → 历史 / 主题。
 
 B1 拆分：从 ui/main_window 抽出，主窗只组装。
 """
@@ -19,7 +19,6 @@ from PySide6.QtWidgets import (
     QFileDialog,
     QFormLayout,
     QFrame,
-    QGridLayout,
     QGroupBox,
     QHBoxLayout,
     QLabel,
@@ -112,20 +111,86 @@ class LeftPanel(QWidget):
         left_layout.setSpacing(8)
 
         scroll = QScrollArea()
+        scroll.setObjectName("LeftScroll")
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         scroll.setMinimumWidth(LEFT_PANEL_MIN_WIDTH - 8)
         body = QWidget()
+        body.setObjectName("LeftScrollBody")
         body.setMinimumWidth(LEFT_PANEL_MIN_WIDTH - 28)
         body_layout = QVBoxLayout(body)
         body_layout.setContentsMargins(4, 4, 10, 4)
         body_layout.setSpacing(8)
+        body_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
         scroll.setWidget(body)
         left_layout.addWidget(scroll, 1)
 
-        # 设备列表：仅设备行默认折叠；添加/删除/保存始终可见
+        # 顺序：扫描目标 → 设备列表 → 开始巡检 → 扫描设置
+        target_group = QGroupBox("扫描目标设备")
+        target_layout = QHBoxLayout(target_group)
+        target_layout.setContentsMargins(8, 8, 8, 8)
+        target_group.setSizePolicy(
+            QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum
+        )
+        self.cmb_scan_target = QComboBox()
+        self.cmb_scan_target.setObjectName("ScanTargetCombo")
+        self.cmb_scan_target.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed
+        )
+        self.cmb_scan_target.setMaxVisibleItems(12)
+        self.cmb_scan_target.setToolTip("选择单台设备，或「全部设备」按队列依次巡检")
+        target_layout.addWidget(self.cmb_scan_target, 1)
+        body_layout.addWidget(target_group)
+
+        # 开始巡检：快速为主按钮，深度为次按钮；取消仅扫描中出现
+        action_group = QGroupBox("开始巡检")
+        action_group.setSizePolicy(
+            QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum
+        )
+        action_layout = QVBoxLayout(action_group)
+        action_layout.setContentsMargins(8, 8, 8, 8)
+        action_layout.setSpacing(6)
+
+        scan_btns = QHBoxLayout()
+        scan_btns.setSpacing(6)
+        self.btn_scan_quick = QPushButton("快速巡检")
+        self.btn_scan_quick.setProperty("role", "primary")
+        self.btn_scan_quick.setToolTip("状态 + 近期录像落盘检查（快速）")
+        self.btn_scan_quick.setMinimumHeight(32)
+        self.btn_scan_deep = QPushButton("深度巡检")
+        self.btn_scan_deep.setToolTip("深度巡检：含录像抽检与音频检查（需 ffmpeg）")
+        self.btn_scan_deep.setMinimumHeight(32)
+        for b in (self.btn_scan_quick, self.btn_scan_deep):
+            b.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+            scan_btns.addWidget(b)
+        action_layout.addLayout(scan_btns)
+
+        deep_opts = QHBoxLayout()
+        deep_opts.setSpacing(6)
+        self.chk_av_save = QCheckBox("保存抽检片段")
+        self.chk_av_save.setToolTip("仅深度巡检时生效：将抽检片段写入保存路径")
+        self.chk_av_save.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed
+        )
+        self.btn_cancel = QPushButton("取消")
+        self.btn_cancel.setEnabled(False)
+        self.btn_cancel.setVisible(False)
+        self.btn_cancel.setToolTip("取消当前巡检")
+        self.btn_cancel.setFixedWidth(64)
+        deep_opts.addWidget(self.chk_av_save, 1)
+        deep_opts.addWidget(self.btn_cancel)
+        action_layout.addLayout(deep_opts)
+
+        self.ffmpeg_label = QLabel("")
+        self.ffmpeg_label.setWordWrap(True)
+        self.ffmpeg_label.setStyleSheet(
+            "color: " + theme.ui_color("muted", False) + "; font-size: 11px;"
+        )
+        action_layout.addWidget(self.ffmpeg_label)
+
+        # 设备列表：明细默认折叠；删除选中在折叠时禁用
         self.btn_toggle_devices = QPushButton("▶  设备列表")
         self.btn_toggle_devices.setProperty("role", "toggle")
         self.btn_toggle_devices.setToolTip("展开 / 折叠设备明细")
@@ -152,21 +217,10 @@ class LeftPanel(QWidget):
         for b in (self.btn_add_dev, self.btn_del_dev, self.btn_save_profile):
             b.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
             btn_row.addWidget(b)
+        self.btn_del_dev.setEnabled(False)
+        self.btn_del_dev.setToolTip("展开设备列表后勾选删除")
         body_layout.addLayout(btn_row)
-
-        # 扫描目标：紧凑原生下拉，少空白
-        target_group = QGroupBox("扫描目标设备")
-        target_layout = QHBoxLayout(target_group)
-        target_layout.setContentsMargins(8, 10, 8, 8)
-        self.cmb_scan_target = QComboBox()
-        self.cmb_scan_target.setObjectName("ScanTargetCombo")
-        self.cmb_scan_target.setSizePolicy(
-            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed
-        )
-        self.cmb_scan_target.setMaxVisibleItems(12)
-        self.cmb_scan_target.setToolTip("选择单台设备，或「全部设备」按队列依次巡检")
-        target_layout.addWidget(self.cmb_scan_target, 1)
-        body_layout.addWidget(target_group)
+        body_layout.addWidget(action_group)
 
         # 扫描设置（折叠）：QFormLayout + 紧凑原生风格输入控件
         self.btn_toggle_settings = QPushButton("▶  扫描设置")
@@ -262,67 +316,13 @@ class LeftPanel(QWidget):
         body_layout.addWidget(self.settings_basic_group)
         body_layout.addWidget(self.settings_deep_group)
 
-        # 巡检操作
-        action_group = QGroupBox("开始巡检")
-        action_layout = QVBoxLayout(action_group)
-        action_layout.setContentsMargins(8, 12, 8, 8)
-        action_layout.setSpacing(6)
-
-        scan_btns = QHBoxLayout()
-        scan_btns.setSpacing(6)
-        self.btn_scan_quick = QPushButton("快速巡检")
-        self.btn_scan_quick.setProperty("role", "primary")
-        self.btn_scan_quick.setToolTip("状态 + 近期录像落盘检查（快速）")
-        self.btn_scan_deep = QPushButton("深度巡检")
-        self.btn_scan_deep.setProperty("role", "primary")
-        self.btn_scan_deep.setToolTip("深度巡检：含录像抽检与音频检查（需 ffmpeg）")
-        for b in (self.btn_scan_quick, self.btn_scan_deep):
-            b.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-            scan_btns.addWidget(b)
-        action_layout.addLayout(scan_btns)
-
-        deep_opts = QHBoxLayout()
-        deep_opts.setSpacing(6)
-        self.chk_av_save = QCheckBox("保存抽检片段")
-        self.chk_av_save.setToolTip("仅深度巡检时生效：将抽检片段写入保存路径")
-        self.chk_av_save.setSizePolicy(
+        self.btn_history = QPushButton("历史报告")
+        self.btn_history.setSizePolicy(
             QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed
         )
-        self.btn_cancel = QPushButton("取消")
-        self.btn_cancel.setEnabled(False)
-        self.btn_cancel.setToolTip("取消当前巡检")
-        self.btn_cancel.setFixedWidth(64)
-        deep_opts.addWidget(self.chk_av_save, 1)
-        deep_opts.addWidget(self.btn_cancel)
-        action_layout.addLayout(deep_opts)
+        self.btn_history.setToolTip("查看已归档的巡检报告")
+        body_layout.addWidget(self.btn_history)
 
-        # ffmpeg 状态放在「开始巡检」最下方
-        self.ffmpeg_label = QLabel("")
-        self.ffmpeg_label.setWordWrap(True)
-        self.ffmpeg_label.setStyleSheet(
-            "color: " + theme.ui_color("muted", False) + "; font-size: 11px;"
-        )
-        action_layout.addWidget(self.ffmpeg_label)
-        body_layout.addWidget(action_group)
-
-        # 底部操作（导出已移至右侧检查结果区）
-        bottom_group = QGroupBox("操作")
-        bottom_grid = QGridLayout(bottom_group)
-        bottom_grid.setContentsMargins(8, 12, 8, 8)
-        bottom_grid.setHorizontalSpacing(6)
-        bottom_grid.setVerticalSpacing(6)
-        bottom_grid.setColumnStretch(0, 1)
-        bottom_grid.setColumnStretch(1, 1)
-        self.btn_open_save = QPushButton("打开保存目录")
-        self.btn_open_config = QPushButton("打开配置目录")
-        self.btn_history = QPushButton("历史报告")
-        for b in (self.btn_open_save, self.btn_open_config, self.btn_history):
-            b.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        bottom_grid.addWidget(self.btn_open_save, 0, 0)
-        bottom_grid.addWidget(self.btn_open_config, 0, 1)
-        bottom_grid.addWidget(self.btn_history, 1, 0, 1, 2)
-
-        # 主题：分段切换 浅色 | 深色 | 跟随系统
         theme_cell = QWidget()
         theme_lay = QVBoxLayout(theme_cell)
         theme_lay.setContentsMargins(0, 4, 0, 0)
@@ -339,15 +339,15 @@ class LeftPanel(QWidget):
         )
         self._theme_group.idClicked.connect(self._on_theme_segment_clicked)
         theme_lay.addWidget(self._theme_seg)
-        bottom_grid.addWidget(theme_cell, 2, 0, 1, 2)
-        body_layout.addWidget(bottom_group)
+        theme_cell.setSizePolicy(
+            QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum
+        )
+        body_layout.addWidget(theme_cell)
         body_layout.addStretch(1)
 
         self.btn_add_dev.clicked.connect(self._add_device)
         self.btn_del_dev.clicked.connect(self._del_device)
         self.btn_save_profile.clicked.connect(self.save_profile_requested.emit)
-        self.btn_open_save.clicked.connect(self._open_save_dir)
-        self.btn_open_config.clicked.connect(self._open_config_dir)
         self.btn_history.clicked.connect(self.history_requested.emit)
         self.btn_scan_quick.clicked.connect(lambda: self.scan_requested.emit("quick"))
         self.btn_scan_deep.clicked.connect(lambda: self.scan_requested.emit("deep"))
@@ -413,6 +413,15 @@ class LeftPanel(QWidget):
         self._device_list_expanded = not self._device_list_expanded
         self.dev_body.setVisible(self._device_list_expanded)
         self._refresh_device_toggle_label()
+        self._sync_device_crud()
+
+    def _sync_device_crud(self) -> None:
+        self.btn_del_dev.setEnabled(self._device_list_expanded)
+        self.btn_del_dev.setToolTip(
+            "勾选设备后删除"
+            if self._device_list_expanded
+            else "展开设备列表后勾选删除"
+        )
 
     def _refresh_device_toggle_label(self) -> None:
         n = len(self._device_rows)
@@ -736,6 +745,11 @@ class LeftPanel(QWidget):
 
     def _on_device_dialog_add(self, device: Dict[str, Any]) -> None:
         self._add_device_row(device)
+        if not self._device_list_expanded:
+            self._device_list_expanded = True
+            self.dev_body.setVisible(True)
+            self._refresh_device_toggle_label()
+            self._sync_device_crud()
         self.log_requested.emit(
             f"已添加设备：{device.get('name')} ({device.get('ip')})", "ok"
         )
@@ -972,13 +986,22 @@ class LeftPanel(QWidget):
         import subprocess
         import sys
 
+        # Popen 不等待: xdg-open 在异常环境下可能阻塞数秒冻结 UI
         try:
             if sys.platform == "darwin":
-                subprocess.run(["open", path], check=False)
+                subprocess.Popen(
+                    ["open", path],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
             elif sys.platform == "win32":
                 os.startfile(path)  # type: ignore[attr-defined]
             else:
-                subprocess.run(["xdg-open", path], check=False)
+                subprocess.Popen(
+                    ["xdg-open", path],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
         except Exception as e:
             QMessageBox.critical(self, "打开失败", str(e))
 
@@ -990,4 +1013,5 @@ class LeftPanel(QWidget):
         self.btn_save_profile.setEnabled(enabled)
 
     def set_cancel_enabled(self, enabled: bool) -> None:
+        self.btn_cancel.setVisible(enabled)
         self.btn_cancel.setEnabled(enabled)

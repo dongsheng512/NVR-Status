@@ -206,6 +206,9 @@ class RecordingMixin:
         # 允许当前段 endTime 略早于 now 的容差(秒):连续录像切段/时钟偏差
         lag_grace = 900  # 15 分钟
 
+        # 无时区的时间串按设备本地墙钟解释(与写侧 _fmt_rtsp_time 一致)
+        dev_tz = self._get_device_tz()
+
         def _pick(items: List[ET.Element]) -> Tuple[
             bool, Optional[datetime], Optional[str], Optional[datetime], Optional[datetime]
         ]:
@@ -216,8 +219,8 @@ class RecordingMixin:
             best_et: Optional[datetime] = None
             best_score: Tuple[int, float] = (-1, -1.0)
             for item in items:
-                st = _parse_hik_time(item.findtext(".//startTime"))
-                et = _parse_hik_time(item.findtext(".//endTime"))
+                st = _parse_hik_time(item.findtext(".//startTime"), dev_tz)
+                et = _parse_hik_time(item.findtext(".//endTime"), dev_tz)
                 uri = unescape((item.findtext(".//playbackURI") or "").strip())
                 if et is not None and (latest is None or et > latest):
                     latest = et
@@ -441,9 +444,10 @@ class RecordingMixin:
         best_st = None
         best_et = None
         best_score: Tuple[int, float] = (-1, -1.0)
+        dev_tz = self._get_device_tz()
         for item in matches:
-            st = _parse_hik_time(item.findtext(".//startTime"))
-            et = _parse_hik_time(item.findtext(".//endTime"))
+            st = _parse_hik_time(item.findtext(".//startTime"), dev_tz)
+            et = _parse_hik_time(item.findtext(".//endTime"), dev_tz)
             uri = unescape((item.findtext(".//playbackURI") or "").strip())
             if not uri:
                 continue
@@ -537,7 +541,14 @@ class RecordingMixin:
         disk_lo = 0.28
         disk_hi = 0.70 if self.deep_av_check else 0.92
         if need_search and records:
-            total_n = len(records)
+            # 未配置录像的通道不做检索:省请求,也避免取消时被排队任务拖住
+            to_search = [r for r in records if r["已启用录像"]]
+            for r in records:
+                if r not in to_search:
+                    r["落盘状态"] = "跳过"
+                    r["落盘详情"] = "未配置录像计划"
+
+            total_n = len(to_search)
             self._log(
                 f"正在检查近 {self.lookback_minutes} 分钟是否有录像"
                 f"({total_n} 通道, 并发 {self.search_workers})..."
@@ -552,11 +563,13 @@ class RecordingMixin:
             results: Dict[str, Dict] = {}
 
             def _job(tid: str) -> Tuple[str, Dict]:
+                self._check_cancel()
                 return tid, self._search_track_recent(tid, self.lookback_minutes)
 
             done_n = 0
-            with ThreadPoolExecutor(max_workers=self.search_workers) as pool:
-                futures = [pool.submit(_job, r["track_id"]) for r in records]
+            pool = ThreadPoolExecutor(max_workers=self.search_workers)
+            try:
+                futures = [pool.submit(_job, r["track_id"]) for r in to_search]
                 for fut in as_completed(futures):
                     tid, res = fut.result()
                     results[tid] = res
@@ -575,6 +588,15 @@ class RecordingMixin:
                             phase="disk",
                             overall=overall,
                         )
+            except ScanCancelled:
+                # 立即取消排队任务并让正在执行的请求自然结束,
+                # 不等全部任务跑完(否则取消延迟可达数分钟)
+                pool.shutdown(wait=False, cancel_futures=True)
+                raise
+            except BaseException:
+                pool.shutdown(wait=False, cancel_futures=True)
+                raise
+            pool.shutdown(wait=True)
 
             for r in records:
                 res = results.get(r["track_id"], {

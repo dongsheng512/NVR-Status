@@ -108,6 +108,17 @@ elif [[ -d dist/NVRStatus/bin ]]; then
   _restore_portable_ffmpeg "dist/NVRStatus/bin"
 fi
 
+# 覆盖 ffmpeg 后外层签名已失效(nested code modified),整体重新 ad-hoc 签名
+if [[ -d dist/NVRStatus.app ]] && command -v codesign >/dev/null 2>&1; then
+  echo "==> 重新 ad-hoc 签名(封签一致性)"
+  codesign --force --deep --sign - dist/NVRStatus.app 2>/dev/null || true
+  if codesign --verify --deep --strict dist/NVRStatus.app 2>/dev/null; then
+    echo "==> 签名校验 OK"
+  else
+    echo "==> 警告: 签名校验未通过(不影响本机运行,分发前建议重新签名)"
+  fi
+fi
+
 # 体积报告
 echo "==> 体积"
 if [[ -d dist/NVRStatus.app ]]; then
