@@ -12,7 +12,7 @@
 - **布局**：左侧顺序为扫描目标 → 设备列表 → 开始巡检 → 扫描设置；空闲态右侧更紧凑
 - **巡检结果**：通道表优先；预警收成一行摘要（可展开）；日志默认可折叠；完成后隐藏进度条
 - **外观**：亮/暗双层画布（窗口底 vs 卡片）；macOS 透明标题栏，空白处可拖动窗口
-- **安装包**：macOS arm64 完整包（含 ffmpeg），见 [Releases](https://github.com/dongsheng512/cam-gui/releases)
+- **安装包**：macOS arm64 完整包（含 ffmpeg），见 [Releases](https://github.com/dongsheng512/NVR-Status/releases)
 
 ---
 
