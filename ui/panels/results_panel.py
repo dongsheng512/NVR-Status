@@ -21,6 +21,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from nvr_core.scan_runner import AV_FIELDS
 from ui import theme
 from ui.widgets.channel_table import ChannelTableView, row_tag
 
@@ -69,7 +70,7 @@ METRIC_TITLES: Dict[str, str] = {
     "online": "摄像头在线",
     "record": "录像正常",
     "disk": "近期有录像",
-    "audio": "含音频配置",
+    "audio": "音频配置",
 }
 
 
@@ -244,6 +245,7 @@ class ResultsExpandWindow(QWidget):
 
     export_requested = Signal()
     detail_requested = Signal(object)
+    single_check_requested = Signal(list)
 
     def __init__(self, parent: Optional[QWidget] = None):
         super().__init__(parent, Qt.WindowType.Window)
@@ -281,6 +283,9 @@ class ResultsExpandWindow(QWidget):
         self.channel_table.view.doubleClicked.connect(self._on_double_click)
         self.channel_table.detail_requested.connect(self.detail_requested.emit)
         self.channel_table.export_requested.connect(self.export_requested.emit)
+        self.channel_table.single_check_requested.connect(
+            self.single_check_requested.emit
+        )
         root.addWidget(self.channel_table, 1)
 
         self.tip_label = QLabel("提示：双击行查看通道详情 · 右键可复制/导出 · 支持「仅异常 / 仅离线」筛选")
@@ -323,6 +328,7 @@ class ResultsPanel(QWidget):
     export_requested = Signal()
     detail_requested = Signal(object)
     log_requested = Signal(str, str)
+    single_check_requested = Signal(list)  # 选中通道记录列表
     layout_mode_changed = Signal(bool)  # True=有巡检结果（通道表展开）
 
     def __init__(self, parent: Optional[QWidget] = None):
@@ -409,6 +415,9 @@ class ResultsPanel(QWidget):
         self.channel_table.detail_requested.connect(self.open_channel_detail)
         self.channel_table.export_requested.connect(self.export_requested.emit)
         self.channel_table.expand_requested.connect(self.show_results_window)
+        self.channel_table.single_check_requested.connect(
+            self.single_check_requested.emit
+        )
         self.channel_table.hide()
         root.addWidget(self.channel_table, 1)
         self.setSizePolicy(
@@ -470,6 +479,7 @@ class ResultsPanel(QWidget):
             win = ResultsExpandWindow(self)
             win.export_requested.connect(self.export_requested.emit)
             win.detail_requested.connect(self.open_channel_detail)
+            win.single_check_requested.connect(self.single_check_requested.emit)
             self._results_window = win
         self._push_to_results_window(win)
         win.show()
@@ -608,7 +618,11 @@ class ResultsPanel(QWidget):
 
         online = stats.get("摄像头在线", 0)
         offline = stats.get("摄像头离线", 0)
-        total = stats.get("摄像头总数", len(records))
+        # 两个口径不要混用:摄像头数是 physical channel 数,
+        # 而录像/落盘/音频计数都基于 records(Track),分母必须用通道数,
+        # 否则一通道多 Track 的机型会出现 "5/4" 这类失真比例。
+        cam_total = stats.get("摄像头总数", len(records))
+        rec_total = len(records)
         tone = "ok" if status == "良好" else ("bad" if status == "严重" else "warn")
 
         disk_checked = bool(stats.get("落盘已检查", True))
@@ -619,7 +633,7 @@ class ResultsPanel(QWidget):
         if not record_checked:
             rec_title, rec_value, rec_tone = "录像正常", "未检查", "muted"
         else:
-            rec_title, rec_value, rec_tone = "录像正常", f"{rec_ok}/{total}", ("bad" if rec_bad else "ok")
+            rec_title, rec_value, rec_tone = "录像正常", f"{rec_ok}/{rec_total}", ("bad" if rec_bad else "ok")
 
         disk_ok = stats.get("落盘正常", 0)
         disk_bad = stats.get("落盘异常", 0)
@@ -627,21 +641,94 @@ class ResultsPanel(QWidget):
             disk_title, disk_value, disk_tone = "近期有录像", "未检查", "muted"
         else:
             disk_title = "近期有录像"
-            disk_value = f"{disk_ok}/{total}"
+            disk_value = f"{disk_ok}/{rec_total}"
             if stats.get("落盘未知", 0) and not disk_ok and not disk_bad:
                 disk_value, disk_tone = "未检查", "muted"
             else:
                 disk_tone = "bad" if disk_bad else "ok"
 
         audio_yes = stats.get("含音频", 0)
-        audio_tone = "ok" if audio_yes == total and total else "warn"
+        # 音频卡片有两套口径，不能混：
+        #   非深度抽检 → 看「录像配置是否开音频」(SaveAudio)；
+        #   深度抽检   → 看「实测能不能拉到音轨」(音频抽检)。
+        # 配置开了不等于拉得到音轨（无音轨=异常），配置没开也不算抽检失败（跳过）。
+        # 通道数为 0（空结果集）时应显示「未检查」，不能落成黄色告警。
+        if not rec_total:
+            audio_title, audio_value, audio_tone, audio_tip = (
+                "含音频配置",
+                "未检查",
+                "muted",
+                "本次无通道记录",
+            )
+            audio_line = ""
+        elif deep:
+            a_ok = a_warn = a_bad = a_skip = a_unknown = 0
+            for r in records:
+                st = r.get("音频抽检")
+                if st == "正常":
+                    a_ok += 1
+                elif st == "警告":
+                    a_warn += 1
+                elif st == "异常":
+                    a_bad += 1
+                elif st == "跳过":
+                    a_skip += 1
+                else:  # 未知 / 字段缺失
+                    a_unknown += 1
+            sampled = a_ok + a_warn + a_bad + a_unknown
+            audio_title = "音频实测"
+            if not sampled:
+                audio_value, audio_tone = "未采样", "muted"
+            else:
+                audio_value = f"{a_ok + a_warn}/{sampled}"
+                if a_bad:
+                    audio_tone = "bad"
+                elif a_warn or a_unknown:
+                    audio_tone = "warn"
+                else:
+                    audio_tone = "ok"
+            parts = [f"正常 {a_ok}"]
+            if a_warn:
+                parts.append(f"静音警告 {a_warn}")
+            if a_bad:
+                parts.append(f"无音轨 {a_bad}")
+            if a_unknown:
+                parts.append(f"未确认 {a_unknown}")
+            if a_skip:
+                parts.append(f"未开音频/跳过 {a_skip}")
+            audio_tip = " · ".join(parts)
+            audio_line = f" · 音频实测 {a_ok + a_warn}/{sampled}" if sampled else " · 音频未采样"
+            if a_bad:
+                audio_line += f"(无音轨 {a_bad})"
+        else:
+            audio_title = "含音频配置"
+            audio_value = f"{audio_yes}/{rec_total}"
+            audio_tone = "ok" if audio_yes == rec_total else "warn"
+            a_unknown = int(stats.get("音频未知", 0) or 0)
+            audio_tip = f"已开启 {audio_yes} / 共 {rec_total}"
+            if a_unknown:
+                audio_tip += f"，另有 {a_unknown} 路状态未知"
+            audio_line = ""
+
+        # 摄像头在线卡：离线 → bad；「在线但通道检测状态异常」→ warn；
+        # 在线状态未确认（online 缺失且检测状态也给不出结论）只在 tooltip 里说明，
+        # 不进卡片数值，避免把未确认当成异常。
+        cam_unconfirmed = int(stats.get("摄像头状态未确认", 0) or 0)
+        cam_detect_bad = int(stats.get("通道检测异常", 0) or 0)
+        online_tone = "bad" if offline else ("warn" if cam_detect_bad else "ok")
+        online_tip_parts = []
+        if cam_detect_bad:
+            online_tip_parts.append(f"{cam_detect_bad} 路在线但通道检测异常(IP 冲突/网络不可达等)")
+        if cam_unconfirmed:
+            online_tip_parts.append(f"{cam_unconfirmed} 路在线状态未确认")
+        online_tip = "；".join(online_tip_parts)
 
         metrics_snap: List[tuple] = [
             ("health", "健康状态", str(status), tone, ""),
-            ("online", "摄像头在线", f"{online}/{total}", "bad" if offline else "ok", ""),
+            ("online", "摄像头在线", f"{online}/{cam_total}", online_tone, online_tip),
             ("record", rec_title, rec_value, rec_tone, ""),
             ("disk", disk_title, disk_value, disk_tone, ""),
-            ("audio", "含音频配置", f"{audio_yes}/{total}", audio_tone, ""),
+            ("audio", audio_title, audio_value, audio_tone, audio_tip),
         ]
         self._last_metrics_snapshot = metrics_snap
         for key, title, value, m_tone, tip in metrics_snap:
@@ -699,7 +786,8 @@ class ResultsPanel(QWidget):
                 f"异常{stats.get('视频抽检异常', 0)}  "
                 f"音频 正常{stats.get('音频抽检正常', 0)}/"
                 f"异常{stats.get('音频抽检异常', 0)}/"
-                f"警告{stats.get('音频抽检警告', 0)}"
+                f"警告{stats.get('音频抽检警告', 0)}/"
+                f"未确认{stats.get('音频抽检未知', 0)}"
             )
         warn_html = self._warn_html(lines, theme.effective_dark())
         self._last_warn_lines = list(lines)
@@ -730,8 +818,9 @@ class ResultsPanel(QWidget):
                 )
 
         self.log_requested.emit(
-            f"巡检完成 · 健康 {status} · 在线 {online}/{total}"
-            f" · 离线 {offline} · 录像异常 {rec_bad} · 近期无录像 {disk_bad}"
+            f"巡检完成 · 健康 {status} · 在线 {online}/{cam_total}"
+            f" · 离线 {offline} · 通道 {rec_total} · 录像异常 {rec_bad} · 近期无录像 {disk_bad}"
+            + audio_line
             + (f" · 问题通道 {issue_n}" if issue_n else ""),
             "ok" if status == "良好" else ("error" if status == "严重" else "warn"),
         )
@@ -741,6 +830,40 @@ class ResultsPanel(QWidget):
         self.channel_table.set_result_actions_enabled(enabled and has_result)
         if self._results_window is not None:
             self._results_window.btn_export.setEnabled(enabled and has_result)
+
+    # ---------- 单路深度抽检 ----------
+
+    def set_single_check_running(self, running: bool) -> None:
+        """单路抽检进行中：主表与大窗的按钮同步禁用。"""
+        self.channel_table.set_single_check_running(running)
+        if self._results_window is not None:
+            self._results_window.channel_table.set_single_check_running(running)
+
+    def apply_single_check_result(
+        self, originals: List[Dict[str, Any]], updated: List[Dict[str, Any]]
+    ) -> None:
+        """把单路抽检结果回写进当前结果集(按传入顺序一一对应)。
+
+        originals 是结果集里的**原记录**(渲染时传给表格的同一批 dict)，
+        updated 是 run_single_av_check 返回的副本；只回写抽检相关字段，
+        健康汇总不动 —— 单路复查是诊断动作，不代表整机重新巡检。
+        """
+        if not self._last_result:
+            return
+        fields = AV_FIELDS
+        for orig, upd in zip(originals, updated):
+            if orig is None or upd is None:
+                continue
+            patch = {k: upd.get(k) for k in fields if k in upd}
+            self.channel_table.model.update_record_fields(orig, patch)
+        # 抽检列之前可能没展示(快速巡检结果)，抽检完成后切到深度列
+        if not self._last_channel_deep:
+            self._last_channel_deep = True
+            self.channel_table.set_records(
+                list(self._last_result.get("records") or []), True
+            )
+            self._sync_result_chrome()
+        self.refresh_results_window()
 
     @property
     def last_result(self) -> Optional[Dict[str, Any]]:

@@ -5,9 +5,67 @@ B2 拆分：原 HikvisionNVR 的 get_health_summary。
 
 from __future__ import annotations
 
-from typing import Dict
+from typing import Dict, List
 
 from nvr_core.util import _to_float
+
+# ── 通道检测状态（InputProxy/.../status 的 chanDetectResult）口径 ──
+# 海康该字段比 `online` 更细，能反映通道级异常（未接入 / 网络不可达 / IP 冲突等），
+# 但各固件取值并不统一。因此采用**白名单**策略：
+#   · 明确正常的取值 → 判为「在线」
+#   · 明确异常的取值 → 判为「异常」
+#   · 其余（含空、未知、我们不认识的取值）→ 返回 ""，一律不参与判定
+# 宁可漏判也不误报：新增机型出现没见过的取值时，只是少一层判断力，不会误报。
+_DETECT_ONLINE_VALUES = {"connect", "connected", "normal", "ok", "online", "已配置"}
+_DETECT_ABNORMAL_VALUES = {
+    "notexist",            # 通道不存在 / 未接入
+    "disconnect",          # 连接断开
+    "disconnected",
+    "neterror",            # 网络不可达
+    "networkerror",
+    "ipconflict",          # IP 冲突
+    "ipaddressconflict",
+    "userpwerror",         # 用户名 / 密码错误
+    "passworderror",
+    "userlocked",          # 用户被锁定
+    "locked",
+    "unsupported",         # 不支持
+    "notsupport",
+}
+# 异常取值 → 人类可读原因（离线预警里用它细分原因；未命中则回退原值）
+_DETECT_REASON = {
+    "notexist": "通道未接入",
+    "disconnect": "连接断开",
+    "disconnected": "连接断开",
+    "neterror": "网络不可达",
+    "networkerror": "网络不可达",
+    "ipconflict": "IP 冲突",
+    "ipaddressconflict": "IP 冲突",
+    "userpwerror": "用户名或密码错误",
+    "passworderror": "用户名或密码错误",
+    "userlocked": "用户被锁定",
+    "locked": "用户被锁定",
+    "unsupported": "不支持",
+    "notsupport": "不支持",
+}
+
+
+def classify_detect_state(raw) -> str:
+    """把 chanDetectResult 归一为 "在线" / "异常" / ""（未知，不参与判定）。"""
+    s = str(raw or "").strip().lower()
+    if not s:
+        return ""
+    if s in _DETECT_ABNORMAL_VALUES:
+        return "异常"
+    if s in _DETECT_ONLINE_VALUES:
+        return "在线"
+    return ""
+
+
+def detect_reason(raw) -> str:
+    """取异常取值的中文原因；无法映射时返回原值（去空白）。"""
+    s = str(raw or "").strip()
+    return _DETECT_REASON.get(s.lower(), s)
 
 
 class HealthMixin:
@@ -94,14 +152,58 @@ class HealthMixin:
         if sleeping_drives:
             health["预警信息"].append(f"{len(sleeping_drives)}块硬盘处于休眠状态")
 
-        # 摄像头离线检查
+        # 摄像头在线检查
+        # 以 `在线` 为主判据，并用 `检测状态`(chanDetectResult) 做交叉校验：
+        #   · online=false            → 离线
+        #   · online=true             → 在线（若检测状态明确异常，另记一条通道异常）
+        #   · online 缺失/取值异常时   → 用检测状态补判（connect→在线，异常→离线）
+        #   · 两者都非明确取值         → 未确认（不误报离线）
         cameras = self.get_cameras()
-        offline = [c for c in cameras if c.get("在线") == "false"]
+        offline: List[Dict] = []
+        detect_bad: List[Dict] = []
+        unconfirmed = 0
+        online_n = 0
+        for c in cameras:
+            raw_online = str(c.get("在线") or "").strip().lower()
+            det = classify_detect_state(c.get("检测状态"))
+            if raw_online == "false":
+                offline.append(c)
+            elif raw_online == "true":
+                online_n += 1
+                if det == "异常":
+                    detect_bad.append(c)
+            elif det == "在线":
+                online_n += 1
+            elif det == "异常":
+                offline.append(c)
+            else:
+                unconfirmed += 1
+
         if offline:
             raise_to("严重")
             names = "、".join(c["名称"] for c in offline if c["名称"] != "未知")
+            # 原因细分：优先用通道检测状态解释离线原因（未接入 / 网络不可达 …）
+            reasons: Dict[str, int] = {}
+            for c in offline:
+                det = classify_detect_state(c.get("检测状态"))
+                if det == "异常":
+                    label = detect_reason(c.get("检测状态"))
+                    reasons[label] = reasons.get(label, 0) + 1
+            detail = ""
+            if reasons:
+                detail = "：" + "、".join(
+                    f"{k} {v}" for k, v in sorted(reasons.items(), key=lambda kv: -kv[1])
+                )
             health["预警信息"].append(
-                f"{len(offline)}个摄像头离线" + (f"({names})" if names else "")
+                f"{len(offline)}个摄像头离线"
+                + (detail if detail else (f"({names})" if names else ""))
+            )
+
+        if detect_bad:
+            raise_to("警告")
+            health["预警信息"].append(
+                f"{len(detect_bad)}个在线通道检测状态异常"
+                "(IP 冲突 / 网络不可达等，建议核对通道)"
             )
 
         # 录像:计划 / 音频 / 落盘
@@ -130,8 +232,11 @@ class HealthMixin:
             "音频抽检正常": 0,
             "音频抽检异常": 0,
             "音频抽检警告": 0,
-            "摄像头在线": sum(1 for c in cameras if c.get("在线") == "true"),
+            "音频抽检未知": 0,
+            "摄像头在线": online_n,
             "摄像头离线": len(offline),
+            "摄像头状态未确认": unconfirmed,
+            "通道检测异常": len(detect_bad),
             "摄像头总数": len(cameras),
             "深度抽检": self.deep_av_check,
             "循环覆盖": ow_label,
@@ -183,6 +288,8 @@ class HealthMixin:
                     stats["音频抽检异常"] += 1
                 elif r.get("音频抽检") == "警告":
                     stats["音频抽检警告"] += 1
+                elif r.get("音频抽检") == "未知":
+                    stats["音频抽检未知"] += 1
 
             # 计划/音频来自配置查询，快速模式仍可预警
             if stats["计划未配置"]:
@@ -213,10 +320,21 @@ class HealthMixin:
                             f"{stats['落盘异常']}个通道近期无录像{more}"
                         )
 
-                if stats["落盘未知"]:
+                # 「落盘未知」口径（与「音频抽检未知」保持一致）：
+                # 成因多为瞬时检索超时，单路抖动不应把整机降级为警告。
+                # 仅当**实际检索到的通道全部未知**（整体检索失败）才升级为警告；
+                # 部分未知只进统计与结果区（录像卡片已有提示），不参与健康判定。
+                disk_attempted = (
+                    stats["落盘正常"] + stats["落盘异常"] + stats["落盘未知"]
+                )
+                if (
+                    stats["落盘未知"]
+                    and disk_attempted
+                    and stats["落盘未知"] >= disk_attempted
+                ):
                     raise_to("警告")
                     health["预警信息"].append(
-                        f"{stats['落盘未知']}个通道近期录像状态未知(检索失败)"
+                        f"{stats['落盘未知']}个通道近期录像状态未知(整体检索失败)"
                     )
 
             if self.deep_av_check:
@@ -234,6 +352,23 @@ class HealthMixin:
                     raise_to("警告")
                     health["预警信息"].append(
                         f"{stats['音频抽检警告']}个通道音频疑似静音/电平过低"
+                    )
+                # 「音频抽检未知」与「落盘未知」同口径：部分未知（瞬时拉流超时）不降级，
+                # 仅当实际抽到的通道全部未确认（整体拉流失败）才升级为警告。
+                audio_attempted = (
+                    stats["音频抽检正常"]
+                    + stats["音频抽检异常"]
+                    + stats["音频抽检警告"]
+                    + stats["音频抽检未知"]
+                )
+                if (
+                    stats["音频抽检未知"]
+                    and audio_attempted
+                    and stats["音频抽检未知"] >= audio_attempted
+                ):
+                    raise_to("警告")
+                    health["预警信息"].append(
+                        f"{stats['音频抽检未知']}个通道音频抽检未确认(整体拉流失败)"
                     )
 
         health["统计"] = stats

@@ -84,7 +84,7 @@ powershell -ExecutionPolicy Bypass -File build\build_win.ps1 -Lite
 ### 3.3 手动 PyInstaller / 环境变量
 
 ```bash
-uv pip install "pyinstaller>=6.0.0"
+uv sync        # pyinstaller 在 dev 依赖组里,一并装好
 uv run pyinstaller --noconfirm NVRStatus.spec
 
 # 不捆绑 ffmpeg:

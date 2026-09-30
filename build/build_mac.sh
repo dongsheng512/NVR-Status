@@ -30,8 +30,8 @@ if [[ "$LITE" == "1" ]]; then
 fi
 
 echo "==> 安装依赖"
+# pyinstaller 在 dev 依赖组里,uv sync 会一并装好
 uv sync
-uv pip install "pyinstaller>=6.0.0"
 
 if [[ "${NVR_LITE:-}" != "1" && "${NVR_BUNDLE_FFMPEG:-1}" != "0" ]]; then
   # 可选: 复制系统 ffmpeg 到 bin/ 以便捆绑

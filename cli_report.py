@@ -164,10 +164,18 @@ def render_device_report(report: Dict[str, Any], *, verbose: bool = False) -> No
     cam_total = stats.get("摄像头总数", len(cameras))
     cam_on = stats.get("摄像头在线", 0)
     cam_off = stats.get("摄像头离线", 0)
+    cam_detect_bad = int(stats.get("通道检测异常", 0) or 0)
+    cam_unknown = int(stats.get("摄像头状态未确认", 0) or 0)
+    cam_detail = f"在线 {cam_on} / 离线 {cam_off}"
+    if cam_detect_bad:
+        cam_detail += f" / 通道检测异常 {cam_detect_bad}"
+    if cam_unknown:
+        cam_detail += f" / 未确认 {cam_unknown}"
+    cam_detail += f" · 共 {cam_total}"
     metrics.add_row(
         "摄像头",
         _cell("正常" if cam_off == 0 and cam_total else ("异常" if cam_off else "未知")),
-        f"在线 {cam_on} / 离线 {cam_off} · 共 {cam_total}",
+        cam_detail,
     )
     plan_ok = stats.get("计划已配置", 0)
     plan_bad = stats.get("计划未配置", 0)
@@ -197,16 +205,24 @@ def render_device_report(report: Dict[str, Any], *, verbose: bool = False) -> No
         a_ok = stats.get("音频抽检正常", 0)
         a_bad = stats.get("音频抽检异常", 0)
         a_warn = stats.get("音频抽检警告", 0)
+        a_unk = stats.get("音频抽检未知", 0)
         av_status = "正常"
         if v_bad or a_bad:
             av_status = "异常"
-        elif a_warn:
+        elif a_warn or a_unk:
             av_status = "警告"
+        av_channels = report.get("av_channels") or []
+        av_scope = (
+            " · 仅通道 " + "、".join(str(c) for c in av_channels)
+            if av_channels
+            else ""
+        )
         metrics.add_row(
             "音视频抽检",
             _cell(av_status),
-            f"视频 {v_ok}/{v_ok + v_bad} · 音频 正常{a_ok}/异常{a_bad}/警告{a_warn}"
-            f" · {report.get('av_seconds', 6)}s RTSP",
+            f"视频 {v_ok}/{v_ok + v_bad} · 音频 正常{a_ok}/异常{a_bad}/警告{a_warn}/未确认{a_unk}"
+            f" · {report.get('av_seconds', 6)}s RTSP"
+            f"{av_scope}",
         )
 
     dsum = _sum_drives(drives)
@@ -256,6 +272,20 @@ def render_device_report(report: Dict[str, Any], *, verbose: bool = False) -> No
     problem = [r for r in records if _is_problem_record(r, deep)]
     console.print()
     console.print(Rule(f"通道  ·  共 {len(records)} 路", style="cyan"))
+
+    # 抽检时段（含 --av-at 定点时刻与前移说明）：无论是否只看异常都先给出，
+    # 否则「钉住某时刻」的结果无从确认落点。
+    if records:
+        stamps: List[str] = []
+        for r in records:
+            lbl = str(r.get("抽检时段") or "").strip()
+            if lbl and lbl not in stamps:
+                stamps.append(lbl)
+        if stamps:
+            shown = "  |  ".join(stamps[:4])
+            if len(stamps) > 4:
+                shown += f"  |  …共 {len(stamps)} 段"
+            console.print(Text(f"  抽检时段: {shown}", style="dim cyan"))
 
     if not records:
         console.print(Text("  无通道数据", style="yellow"))

@@ -23,7 +23,7 @@ def _set_qt_attrs() -> None:
     # 高 DPI 默认启用；设置组织/应用名便于 QSettings
     QCoreApplication.setOrganizationName("NVRStatus")
     QCoreApplication.setApplicationName("NVRStatus")
-    QCoreApplication.setApplicationVersion("2.2.0")
+    QCoreApplication.setApplicationVersion("2.3.0")
     try:
         QCoreApplication.setAttribute(Qt.ApplicationAttribute.AA_EnableHighDpiScaling, True)
     except Exception:
@@ -91,7 +91,7 @@ def main() -> None:
 
     app = QApplication(sys.argv)
     app.setApplicationName("NVRStatus")
-    app.setApplicationVersion("2.2.0")
+    app.setApplicationVersion("2.3.0")
 
     from ui import theme
     from ui.main_window import MainWindow

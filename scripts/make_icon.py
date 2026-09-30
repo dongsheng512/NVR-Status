@@ -42,6 +42,17 @@ from PySide6.QtGui import (
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ASSETS = os.path.join(ROOT, "assets")
 MASTER = 1024
+# Apple macOS 11+ icon grid: 824×824 art centered on 1024 (100px gutter).
+# Filling the canvas makes Launchpad/Dock icons look larger than neighbors.
+ART_RATIO = 824 / 1024
+CORNER_RATIO = 0.225  # 185.4px at 824
+
+
+def _art_metrics(s: int) -> tuple[float, float, float]:
+    art = s * ART_RATIO
+    margin = (s - art) / 2.0
+    radius = art * CORNER_RATIO
+    return margin, art, radius
 
 
 def _rounded_rect(x, y, w, h, r) -> QPainterPath:
@@ -51,12 +62,14 @@ def _rounded_rect(x, y, w, h, r) -> QPainterPath:
 
 
 def draw_background(p: QPainter, s: int) -> None:
-    """macOS 风格圆角方形底板:深蓝渐变 + 顶部内高光。"""
-    radius = s * 0.225
-    margin = 0  # 全幅
-    rect = QRectF(margin, margin, s - 2 * margin, s - 2 * margin)
+    """macOS 风格圆角方形底板:深蓝渐变 + 顶部内高光。
 
-    grad = QLinearGradient(0, 0, 0, s)
+    底板按 824/1024 图标网格内缩，四周透明，避免 Launchpad 里比系统图标更大。
+    """
+    margin, art, radius = _art_metrics(s)
+    rect = QRectF(margin, margin, art, art)
+
+    grad = QLinearGradient(rect.topLeft(), rect.bottomLeft())
     grad.setColorAt(0.0, QColor("#31445F"))
     grad.setColorAt(0.55, QColor("#1E2E47"))
     grad.setColorAt(1.0, QColor("#101C30"))
@@ -64,13 +77,15 @@ def draw_background(p: QPainter, s: int) -> None:
     p.setBrush(QBrush(grad))
     p.drawPath(_rounded_rect(rect.x(), rect.y(), rect.width(), rect.height(), radius))
 
-    # 顶部边缘内高光(细描边,增强立体感)
     p.setBrush(Qt.BrushStyle.NoBrush)
-    pen = QPen(QColor(255, 255, 255, 26), s * 0.006)
+    inset = art * 0.005
+    pen = QPen(QColor(255, 255, 255, 26), max(1.0, art * 0.0075))
     p.setPen(pen)
-    p.drawPath(_rounded_rect(rect.x() + s * 0.004, rect.y() + s * 0.004,
-                             rect.width() - s * 0.008, rect.height() - s * 0.008,
-                             radius * 0.96))
+    p.drawPath(_rounded_rect(
+        rect.x() + inset, rect.y() + inset,
+        rect.width() - 2 * inset, rect.height() - 2 * inset,
+        radius * 0.96,
+    ))
 
 
 def draw_signal_arcs(p: QPainter, s: int) -> None:
@@ -180,8 +195,11 @@ def render(size: int) -> QPixmap:
     p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
     p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
     draw_background(p, size)
-    draw_signal_arcs(p, size)
-    draw_camera(p, size)
+    # Camera/arcs are authored for a full square; draw them in the 824 art box.
+    margin, art, _radius = _art_metrics(size)
+    p.translate(margin, margin)
+    draw_signal_arcs(p, int(round(art)))
+    draw_camera(p, int(round(art)))
     p.end()
     return pm
 

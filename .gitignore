@@ -35,3 +35,6 @@ cam.md
 
 # 本地代理/会话缓存
 .mimosa/
+
+# Agent 会话记忆（工具状态，非项目源码）
+.workbuddy/

@@ -118,3 +118,46 @@ def test_compute_clip_window_clamps_outside_segment():
     assert cs == uri_s
     assert (ce - cs).total_seconds() >= 1
     assert ce <= uri_e
+
+
+def test_compute_clip_window_keeps_10_min_from_now():
+    n = _nvr()
+    now = datetime.now(timezone.utc)
+    uri_s = now - timedelta(hours=1)
+    uri_e = now
+    cs, ce = n._compute_clip_window(uri_s, uri_e, 6)
+    assert ce <= now - timedelta(minutes=10) + timedelta(seconds=2)
+    assert cs < ce
+    assert cs >= uri_s
+
+
+def test_compute_clip_window_caps_explicit_clip_near_now():
+    n = _nvr()
+    now = datetime.now(timezone.utc)
+    uri_s = now - timedelta(hours=1)
+    uri_e = now
+    cs, ce = n._compute_clip_window(
+        uri_s, uri_e, 6,
+        clip_start=now - timedelta(seconds=20),
+        clip_end=now,
+    )
+    assert ce <= now - timedelta(minutes=10) + timedelta(seconds=2)
+    assert cs < ce
+
+
+def test_pick_busy_clip_is_at_least_10_min_old():
+    n = _nvr()
+    n.busy_start_hour = 0
+    n.busy_end_hour = 24
+    n.busy_days_ago = 0
+    _cs, ce, _label = n._pick_busy_clip_times(6)
+    now = datetime.now(timezone.utc)
+    assert ce <= now - timedelta(minutes=9, seconds=50)
+
+
+def test_latest_av_sample_instant_is_10_min():
+    from nvr_core.util import AV_SAMPLE_MIN_AGE, latest_av_sample_instant
+
+    now = datetime(2026, 9, 10, 12, 0, tzinfo=timezone.utc)
+    assert latest_av_sample_instant(now) == now - timedelta(minutes=10)
+    assert AV_SAMPLE_MIN_AGE == timedelta(minutes=10)

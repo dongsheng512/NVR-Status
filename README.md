@@ -2,7 +2,18 @@
 
 海康威视 NVR **状态巡检**与**音视频深度抽检**工具，提供 **GUI** 与 **CLI** 两种入口，支持 Windows / macOS 打包分发。
 
-> 版本：`2.2.0` · 语言：Python ≥ 3.11
+> 版本：`2.3.0` · 语言：Python ≥ 3.11
+
+---
+
+## 2.3.0 更新
+
+- **CLI 新增 `--av-channels`**：只抽检指定物理通道（如 `--av-channels 31,64`），排查单点问题不必等全量 64 路跑完；通道号写错直接报错，不静默丢弃
+- **CLI 新增 `--av-at`**：定点抽检时刻（如 `--av-at 19:05,16:20`），每个时刻各查一遍，与 `--av-channels` 叠加即「单通道定点复查」——区分持久故障与间歇抖动（如 IPC 重启后音频是否恢复）；未来时刻直接报错，距现在不足 10 分钟自动前移并注明
+- **GUI 新增「单路抽检」**：巡检完成后在通道列表选中一行（可多选），点「单路抽检」或右键菜单即可只对选中通道重跑音视频抽检并就地刷新，复查单路不必整机重新巡检
+- **回放 RTSP 增加 `:554` 端口回退**：部分环境 `:80` 端口的 RTSP 被设备静默拒绝（TCP 通、`DESCRIBE` 即断），自动补一个同路径 `:554` 兜底候选，正常链路不受影响
+- **判定更准**：通道检测状态（`chanDetectResult`）纳入摄像头在线判定并细分离线原因；「近期录像状态未知」「音频未确认」只有**全部**未确认才降级为警告，单路抖动不再把整机拉低
+- **音频抽检更实**：音频改为独立短拉 `-map 0:a:0` + `volumedetect`，不再与视频捆在一次全流里；报告区分 正常 / 静音警告 / 无音轨 / 未确认
 
 ---
 
@@ -21,7 +32,7 @@
 | 能力 | 说明 |
 |------|------|
 | 状态巡检 | 在线、录像计划、音频、落盘、硬盘、健康汇总 |
-| 深度抽检 | 可选 RTSP 短时抓流；ffmpeg 检测音视频；可保存片段 |
+| 深度抽检 | 可选 RTSP 短时抓流；可指定通道（`--av-channels`）与定点时刻（`--av-at`）；ffmpeg 检测音视频；可保存片段 |
 | 多配置档案 | 下拉切换；新建 + 管理（另存 / 重命名 / 删除 / 导入 / 导出） |
 | 多设备 | 每档案可维护多台 NVR（名称、IP、端口、账号、SSL） |
 | 双入口 | GUI（同事友好）+ CLI（脚本/批量） |
@@ -53,14 +64,24 @@
          └──────────┬────────────┘
                     ▼
 ┌─────────────────────────────────────────┐
-│  hikvision_status.py  (HikvisionNVR)    │
-│  ISAPI 查询 · 录像检查 · 深度 AV 抽检   │
+│  nvr_core/scan_runner.py   统一编排     │
+│  build_nvr · run_nvr · scan_queue       │
 └─────────────────────────────────────────┘
          │
          ▼
-┌──────────────────┐
-│  config_store.py │  多档案配置读写
-└──────────────────┘
+┌─────────────────────────────────────────┐
+│  nvr_core/  业务核心（无 Qt 依赖）      │
+│  isapi_client · storage · recording     │
+│  av_probe · health · util               │
+│  hikvision_status.py = 兼容门面 + CLI   │
+└─────────────────────────────────────────┘
+         │
+         ▼
+┌──────────────────┐   ┌──────────────────┐
+│  config_store.py │   │  services/       │
+│  多档案配置读写  │   │  导出 · 历史 ·   │
+│                  │   │  凭证 (keyring)  │
+└──────────────────┘   └──────────────────┘
 ```
 
 - GUI 用后台线程 `ScanWorker` + Qt Signal 更新进度，避免卡界面  
@@ -87,6 +108,12 @@ cp nvr_config.example.json nvr_config.json
 ./nvr -h
 ./nvr          # 默认巡检配置中全部设备
 ./nvr 1        # 只查第 1 台
+
+# 只抽指定通道（不必等全量 64 路跑完）
+./nvr 1 --deep-av-check --av-channels 31,64
+
+# 单通道定点复查：钉在指定时刻各查一遍，区分持久故障与间歇抖动
+./nvr 1 --deep-av-check --av-channels 31 --av-at 19:05,16:20
 ```
 
 更完整的参数与说明见 **[USAGE.md](USAGE.md)**。
@@ -112,11 +139,12 @@ powershell -ExecutionPolicy Bypass -File build\build_win.ps1
 ```
 cam-gui/
 ├── run_gui.py           # GUI 入口 → ui.app.main
-├── hikvision_status.py  # 海康 ISAPI / 抽检核心
+├── hikvision_status.py  # 兼容门面：CLI 参数/入口 + 旧公共 API 再导出
+├── nvr_core/            # 业务核心（无 Qt）：ISAPI / 存储 / 录像 / 抽检 / 健康 / 编排
 ├── config_store.py      # 配置档案
 ├── cli_report.py        # CLI 报告
-├── nvr                  # CLI 启动脚本
-├── services/            # 无 Qt 依赖的纯逻辑（CSV/TXT 导出）
+├── nvr                  # CLI 启动脚本（多设备）
+├── services/            # 无 Qt 依赖的纯逻辑（导出 / 历史 / 凭证）
 ├── ui/                  # PySide6 GUI（app / main_window / panels / widgets / theme）
 ├── nvr_config.example.json
 ├── NVRStatus.spec       # PyInstaller 规格

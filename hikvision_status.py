@@ -108,6 +108,22 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="最多抽检通道数(用于抽样);默认全部落盘正常通道",
     )
     parser.add_argument(
+        "--av-channels",
+        default=None,
+        metavar="N[,N...]",
+        help="只抽检指定物理通道号(逗号分隔,如 31,64);默认抽检全部候选通道",
+    )
+    parser.add_argument(
+        "--av-at",
+        default=None,
+        metavar="HH:MM[,HH:MM...]",
+        help=(
+            "定点抽检时刻(本地时间,逗号分隔可多个,如 19:05,16:20),"
+            "每个时刻各查一遍;默认按繁忙时段逻辑选点。"
+            "指定时刻若距现在不足10分钟会自动前移并在结果里注明"
+        ),
+    )
+    parser.add_argument(
         "--silence-db",
         type=float,
         default=-80.0,
@@ -157,14 +173,41 @@ def nvr_from_args(args: argparse.Namespace, *, quiet: bool = False) -> Hikvision
     }
     busy_start = getattr(args, "busy_start", None)
     busy_end = getattr(args, "busy_end", None)
+    deep = bool(
+        getattr(args, "deep_av_check", False) or getattr(args, "av_save", False)
+    )
+    av_channels = getattr(args, "av_channels", None)
+    if av_channels and not deep:
+        # 通道过滤只作用于深度抽检；静默留着会让参数看起来「生效了」
+        if not quiet:
+            print(
+                Colors.warning(
+                    "--av-channels 已忽略: 未启用深度抽检"
+                    "(需 --deep-av-check 或 --av-save)"
+                )
+            )
+        av_channels = None
+    av_at = getattr(args, "av_at", None)
+    if av_at and not deep:
+        # 同 --av-channels:定点时刻只作用于深度抽检
+        if not quiet:
+            print(
+                Colors.warning(
+                    "--av-at 已忽略: 未启用深度抽检"
+                    "(需 --deep-av-check 或 --av-save)"
+                )
+            )
+        av_at = None
     options = {
         "lookback": int(getattr(args, "lookback", None) or 60),
         "no_search": bool(getattr(args, "no_search", False)),
         "workers": int(getattr(args, "workers", None) or 8),
-        "deep_av_check": bool(getattr(args, "deep_av_check", False) or getattr(args, "av_save", False)),
+        "deep_av_check": deep,
         "av_seconds": int(getattr(args, "av_seconds", None) or 6),
         "av_workers": int(getattr(args, "av_workers", None) or 2),
         "av_limit": getattr(args, "av_limit", None),
+        "av_channels": av_channels,
+        "av_at": av_at,
         "silence_db": float(getattr(args, "silence_db", None) if getattr(args, "silence_db", None) is not None else -80.0),
         # 0 是合法小时(午夜),不能用 or 兜底
         "busy_start": 10 if busy_start is None else int(busy_start),

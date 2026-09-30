@@ -109,7 +109,7 @@ def export_csv(path: str, data: Dict[str, Any]) -> None:
             "含音频", "不含音频",
             "落盘正常", "落盘异常", "落盘未知",
             "视频抽检正常", "视频抽检异常",
-            "音频抽检正常", "音频抽检异常", "音频抽检警告",
+            "音频抽检正常", "音频抽检异常", "音频抽检警告", "音频抽检未知",
         ):
             if key in stats:
                 w.writerow([label_map.get(key, key), stats.get(key)])

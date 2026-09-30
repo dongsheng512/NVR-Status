@@ -17,7 +17,103 @@ from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import quote
 
-from nvr_core.util import ScanCancelled, _safe_filename
+from nvr_core.util import (
+    ScanCancelled,
+    _safe_filename,
+    _to_int,
+    latest_av_sample_instant,
+)
+
+_NO_MAPPED_STREAM = (
+    "matches no streams",
+    "does not contain any stream",
+    "output file does not contain any stream",
+)
+
+
+def _stderr_no_mapped_stream(text: str) -> bool:
+    t = (text or "").lower()
+    return any(m in t for m in _NO_MAPPED_STREAM)
+
+
+def _audio_verdict(
+    status: str,
+    expect_audio: Optional[bool],
+    mean_db: Optional[float],
+    silence_db: float,
+) -> Tuple[str, str]:
+    """独立音频抽检结论 → (音频抽检, 备注)。
+
+    status: ok / no_stream / fail
+    """
+    if status == "ok":
+        if mean_db is not None and mean_db <= silence_db:
+            return "警告", f"疑似静音(mean {mean_db:.1f}dB)"
+        return "正常", ""
+    if status == "no_stream":
+        if expect_audio is False:
+            return "跳过", "配置未开音频"
+        return "异常", "无音轨"
+    return "未知", "音频未确认(拉流超时/失败)"
+
+
+_AV_SEV = {"正常": 0, "警告": 1, "跳过": 2, "未知": 3, "异常": 4}
+
+
+def _av_severity(video: Optional[str], audio: Optional[str]) -> int:
+    return max(
+        _AV_SEV.get(video or "未知", 3),
+        _AV_SEV.get(audio or "未知", 3),
+    )
+
+
+def av_needs_retry(res: Dict) -> bool:
+    """初检失败/未确认/该时段无回放 → 换时段再抽。"""
+    v = res.get("视频抽检")
+    a = res.get("音频抽检")
+    if v in ("异常", "未知") or a in ("异常", "未知"):
+        return True
+    if v == "跳过":
+        detail = str(res.get("抽检详情") or "")
+        if any(k in detail for k in ("无回放", "无录像", "检索失败")):
+            return True
+    return False
+
+
+def _at_window_rank(video: Optional[str], audio: Optional[str]) -> Tuple[int, int]:
+    """定点抽检多时刻合并的窗口排名(越小越好)。
+
+    第一键:是否给出明确结论(正常/警告/异常 任一)。纯「未知/跳过」窗口属于
+    **缺证据**,不能排在已确认异常的窗口前面 —— 缺证据 ≠ 恢复;
+    第二键:严重度(恢复时刻的正常窗胜过异常窗,明细里保留轨迹)。
+    """
+    definite = 0 if (video in ("正常", "警告", "异常") or audio in ("正常", "警告", "异常")) else 1
+    return (definite, _av_severity(video, audio))
+
+
+def av_candidate_order(label: str) -> Tuple[int, int, str]:
+    """候选排序键：优先原 URI，其次是改写短窗，`:554` 回退一律排最后。
+
+    `@554` 变体只是「原端口整条链路都不通」时的兜底，正常情况下不该插队
+    多试一遍（每次多试都是一次最长 ~30s 的超时等待）。
+    """
+    return (
+        1 if label.endswith("@554") else 0,
+        0 if label.startswith("original") else 1,
+        label,
+    )
+
+
+def _apply_av_result(rec: Dict, res: Dict, sample_label: str = "") -> None:
+    rec["视频抽检"] = res.get("视频抽检", "未知")
+    rec["音频抽检"] = res.get("音频抽检", "未知")
+    rec["抽检详情"] = res.get("抽检详情", "")
+    rec["抽检时段"] = res.get("抽检时段") or sample_label
+    rec["video_codec"] = res.get("video_codec")
+    rec["audio_codec"] = res.get("audio_codec")
+    rec["resolution"] = res.get("resolution")
+    rec["mean_volume_db"] = res.get("mean_volume_db")
+    rec["保存路径"] = res.get("保存路径")
 
 
 class AVProbeMixin:
@@ -49,6 +145,36 @@ class AVProbeMixin:
         user = quote(self.username, safe="")
         pwd = quote(self.password, safe="")
         return f"rtsp://{user}:{pwd}@{authority}{path}"
+
+    def _swap_rtsp_port(self, uri: str, port: int) -> Optional[str]:
+        """把 rtsp URL 的端口换成 port；无显式端口或已是该端口时返回 None。
+
+        用途：CMSearch 返回的 playbackURI 用的是设备的 HTTP 端口（常见 :80），
+        但有些环境下该端口的 RTSP 会被静默拒绝（TCP 连得上、一发 DESCRIBE 就断开），
+        而标准 RTSP 端口 :554 正常 —— 此时需要一个同路径、只换端口的回退候选。
+        """
+        if not uri or not uri.startswith("rtsp://"):
+            return None
+        rest = uri[len("rtsp://") :]
+        slash = rest.find("/")
+        authority = rest if slash < 0 else rest[:slash]
+        path = "" if slash < 0 else rest[slash:]
+        hostport = authority.rsplit("@", 1)[-1]  # 去掉 userinfo
+        if hostport.startswith("["):  # IPv6 字面量 [::1]:80
+            end = hostport.find("]")
+            if end < 0:
+                return None
+            host = hostport[: end + 1]
+            tail = hostport[end + 1 :]
+            cur = tail[1:] if tail.startswith(":") else ""
+        else:
+            host, sep, cur = hostport.partition(":")
+            if not sep:
+                cur = ""
+        if not cur.isdigit() or int(cur) == port:
+            return None
+        userinfo = authority[: len(authority) - len(hostport)]
+        return f"rtsp://{userinfo}{host}:{port}{path}"
 
     def _fmt_rtsp_time_mode(self, dt: datetime, mode: str) -> str:
         """按约定格式化 RTSP starttime/endtime。
@@ -98,34 +224,54 @@ class AVProbeMixin:
         clip_start: Optional[datetime] = None,
         clip_end: Optional[datetime] = None,
     ) -> Tuple[datetime, datetime]:
-        """在录像段 [uri_s, uri_e] 内切出短抽检窗（UTC）。"""
+        """在录像段 [uri_s, uri_e] 内切出短抽检窗（UTC）。
+
+        结束时刻不超过「现在 - 10 分钟」，避免抽正在写入的回放导致超时。
+        """
         now = datetime.now(timezone.utc)
+        cutoff = latest_av_sample_instant(now)
         sec = max(1, int(seconds))
+
+        def _aw(dt: datetime) -> datetime:
+            return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+        uri_s, uri_e = _aw(uri_s), _aw(uri_e)
+        hard_e = min(uri_e, cutoff)
+
         if clip_start is not None and clip_end is not None:
-            cs = clip_start if clip_start.tzinfo else clip_start.replace(tzinfo=timezone.utc)
-            ce = clip_end if clip_end.tzinfo else clip_end.replace(tzinfo=timezone.utc)
+            cs = _aw(clip_start)
+            ce = _aw(clip_end)
             clip_s = max(uri_s, cs)
-            clip_e = min(uri_e, ce)
+            clip_e = min(hard_e, ce)
             if clip_e <= clip_s:
-                clip_s = uri_s
-                clip_e = min(uri_e, uri_s + timedelta(seconds=sec))
+                if ce > cutoff or cs >= cutoff:
+                    clip_e = hard_e
+                    clip_s = max(uri_s, clip_e - timedelta(seconds=sec))
+                else:
+                    clip_s = uri_s
+                    clip_e = min(hard_e, uri_s + timedelta(seconds=sec))
             if (clip_e - clip_s).total_seconds() < max(1, sec // 2):
-                clip_e = min(uri_e, clip_s + timedelta(seconds=sec))
+                clip_e = min(hard_e, clip_s + timedelta(seconds=sec))
         else:
-            clip_e = min(now - timedelta(seconds=3), uri_e - timedelta(seconds=2))
+            clip_e = min(hard_e, uri_e - timedelta(seconds=2))
             if clip_e <= uri_s:
-                clip_e = uri_e
+                clip_e = hard_e
             clip_s = clip_e - timedelta(seconds=sec)
             if clip_s < uri_s:
                 clip_s = uri_s
             if clip_e <= clip_s:
-                clip_e = min(uri_e, clip_s + timedelta(seconds=sec))
+                clip_e = min(hard_e, clip_s + timedelta(seconds=sec))
 
         if clip_e <= clip_s:
             clip_s = uri_s
-            clip_e = min(uri_e, uri_s + timedelta(seconds=sec))
+            clip_e = min(hard_e, uri_s + timedelta(seconds=sec))
         if clip_e <= clip_s:
             clip_e = clip_s + timedelta(seconds=sec)
+        if clip_e > cutoff:
+            clip_e = cutoff
+            clip_s = min(clip_s, clip_e - timedelta(seconds=sec))
+            if clip_s < uri_s:
+                clip_s = uri_s
         return clip_s, clip_e
 
     def _rewrite_rtsp_times(
@@ -251,14 +397,26 @@ class AVProbeMixin:
                 seen.add(url)
                 out.append((label, url))
 
+        def _add_with_port_alt(label: str, url: str) -> None:
+            """同一候选再补一个 :554 变体（原 URI 端口存在且非 554 时）。
+
+            排在原候选**之后**（见 _probe_track_av 的排序），所以正常情况下
+            不会多试一次；只有原端口整条链路都失败时才轮到它。
+            """
+            _add(label, url)
+            alt = self._swap_rtsp_port(url, 554)
+            if alt:
+                _add(label + "@554", alt)
+
         if m:
             primary = mode
             alt = "utc" if primary == "local" else "local"
             for md in (primary, alt):
                 rewritten = self._rewrite_rtsp_times(playback_uri, clip_s, clip_e, md)
-                _add(f"short/{md}", self._inject_rtsp_auth(rewritten))
-        _add("original", self._inject_rtsp_auth(playback_uri))
+                _add_with_port_alt(f"short/{md}", self._inject_rtsp_auth(rewritten))
+        _add_with_port_alt("original", self._inject_rtsp_auth(playback_uri))
         return out
+
     def _prepare_av_save_dir(self) -> Optional[str]:
         """创建本次抽检的保存目录: <项目>/av_samples/<YYYYMMDD_HHMMSS>/"""
         if not self.av_save:
@@ -350,6 +508,185 @@ class AVProbeMixin:
                 except Exception:
                     pass
 
+    def _pull_rtsp_map(
+        self,
+        ffmpeg: str,
+        candidates: List[Tuple[str, str]],
+        tmp_path: str,
+        stream_map: str,
+        seconds: int,
+        extra_args: Optional[List[str]] = None,
+        min_ok: int = 8 * 1024,
+        partial_ok: int = 24 * 1024,
+        timeout_original: Optional[float] = None,
+        timeout_other: Optional[float] = None,
+        sock_us_original: int = 12_000_000,
+        sock_us_other: int = 10_000_000,
+        stop_on_no_stream: bool = False,
+    ) -> Tuple[str, int, str, Optional[Tuple[str, str]]]:
+        """按 -map 拉短时 RTSP 到临时文件。
+
+        返回 (status, size, last_err, used_candidate)；
+        status 为 ok / no_stream / fail。
+        """
+        t_orig = (
+            self.av_seconds + 25 if timeout_original is None else timeout_original
+        )
+        t_other = (
+            self.av_seconds + 30 if timeout_other is None else timeout_other
+        )
+        extra = list(extra_args or [])
+        last_err = ""
+        size = 0
+        saw_no_stream = False
+        for label, rtsp in candidates:
+            self._check_cancel()
+            if os.path.exists(tmp_path):
+                try:
+                    os.truncate(tmp_path, 0)
+                except OSError:
+                    pass
+            if label.startswith("original"):
+                timeout = t_orig
+                sock_us = sock_us_original
+            else:
+                timeout = t_other
+                sock_us = sock_us_other
+            cmd = [
+                ffmpeg, "-y",
+                "-hide_banner", "-loglevel", "error",
+                "-rtsp_transport", "tcp",
+                "-timeout", str(sock_us),
+                "-i", rtsp,
+                "-t", str(seconds),
+                *extra,
+                "-map", stream_map,
+                "-c", "copy",
+                "-f", "matroska",
+                tmp_path,
+            ]
+            try:
+                proc = self._run_cancellable(cmd, timeout=timeout)
+                size = os.path.getsize(tmp_path) if os.path.exists(tmp_path) else 0
+                err = proc.stderr or ""
+                if _stderr_no_mapped_stream(err):
+                    saw_no_stream = True
+                    last_err = (err.strip().splitlines() or ["no mapped stream"])[-1]
+                    if stop_on_no_stream:
+                        return "no_stream", size, last_err, None
+                    continue
+                if size >= min_ok and (
+                    proc.returncode == 0 or size >= partial_ok
+                ):
+                    return "ok", size, "", (label, rtsp)
+                err_lines = err.strip().splitlines()
+                last_err = err_lines[-1] if err_lines else f"rc={proc.returncode}"
+            except subprocess.TimeoutExpired:
+                size = os.path.getsize(tmp_path) if os.path.exists(tmp_path) else 0
+                if size >= partial_ok:
+                    return "ok", size, "", (label, rtsp)
+                last_err = f"拉流超时({label},{timeout}s)"
+                continue
+        if saw_no_stream and size < min_ok:
+            return "no_stream", size, last_err, None
+        return "fail", size, last_err, None
+
+    def _probe_audio_track(
+        self,
+        ffmpeg: str,
+        ffprobe: str,
+        candidates: List[Tuple[str, str]],
+        expect_audio: Optional[bool],
+    ) -> Dict:
+        """视频成功后再单独拉音频轨，确认是否有声（避免全流 demux 卡死）。"""
+        audio_seconds = max(3, min(int(self.av_seconds), 4))
+        tmp_path = None
+        codec = None
+        mean_db = None
+        try:
+            fd, tmp_path = tempfile.mkstemp(prefix="nvr_a_", suffix=".mkv")
+            os.close(fd)
+            status, _size, last_err, _used = self._pull_rtsp_map(
+                ffmpeg,
+                candidates,
+                tmp_path,
+                "0:a:0",
+                audio_seconds,
+                extra_args=["-vn"],
+                min_ok=512,
+                partial_ok=1024,
+                timeout_original=audio_seconds + 10,
+                timeout_other=audio_seconds + 8,
+                sock_us_original=8_000_000,
+                sock_us_other=6_000_000,
+                stop_on_no_stream=True,
+            )
+            if status == "ok":
+                probe_cmd = [
+                    ffprobe, "-v", "error",
+                    "-show_streams",
+                    "-of", "json",
+                    tmp_path,
+                ]
+                p2 = subprocess.run(
+                    probe_cmd, capture_output=True, text=True, timeout=20
+                )
+                if p2.returncode != 0:
+                    status = "fail"
+                    last_err = last_err or "ffprobe解析音频失败"
+                else:
+                    data = json.loads(p2.stdout or "{}")
+                    astreams = [
+                        s for s in (data.get("streams") or [])
+                        if s.get("codec_type") == "audio"
+                    ]
+                    if not astreams:
+                        status = "no_stream"
+                    else:
+                        codec = astreams[0].get("codec_name")
+                        vol_cmd = [
+                            ffmpeg, "-hide_banner", "-nostats",
+                            "-i", tmp_path,
+                            "-t", str(audio_seconds),
+                            "-af", "volumedetect",
+                            "-f", "null", "-",
+                        ]
+                        vp = subprocess.run(
+                            vol_cmd, capture_output=True, text=True, timeout=30
+                        )
+                        mean_m = re.search(
+                            r"mean_volume:\s*([-\d.]+)\s*dB",
+                            vp.stderr or "",
+                        )
+                        if mean_m:
+                            mean_db = float(mean_m.group(1))
+            verdict, note = _audio_verdict(
+                status, expect_audio, mean_db, self.silence_db
+            )
+            if verdict == "未知" and last_err:
+                note = f"{note}: {self._mask_credentials(last_err)[:80]}"
+            return {
+                "音频抽检": verdict,
+                "audio_codec": codec,
+                "mean_volume_db": mean_db,
+                "note": note,
+            }
+        except ScanCancelled:
+            raise
+        except Exception as e:
+            return {
+                "音频抽检": "未知",
+                "audio_codec": None,
+                "mean_volume_db": None,
+                "note": f"音频抽检异常: {self._mask_credentials(str(e))[:80]}",
+            }
+        finally:
+            if tmp_path:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+
     def _probe_track_av(
         self,
         track_id: str,
@@ -411,11 +748,10 @@ class AVProbeMixin:
             result["抽检详情"] = "无法构造短时RTSP地址"
             return result
 
-        # 优先原 URI：球机短窗 seek 慢且易超时；原段 + 仅视频轨通常数秒成功
-        ordered = sorted(
-            candidates,
-            key=lambda x: (0 if x[0] == "original" else 1, x[0]),
-        )
+        # 优先原 URI：球机短窗 seek 慢且易超时；原段 + 仅视频轨通常数秒成功。
+        # @554 变体排在最后 —— 它是「原端口整条链路都不通」时的回退，
+        # 正常情况下不应让它插队多试一遍。
+        ordered = sorted(candidates, key=lambda x: av_candidate_order(x[0]))
 
         tmp_path = None
         try:
@@ -423,9 +759,10 @@ class AVProbeMixin:
             os.close(fd)
             last_err = ""
             size = 0
+            used_video: Optional[Tuple[str, str]] = None
             # 仅映射视频轨：部分球机全流 demux（含 AAC 等音轨）会挂死，
-            # 真机青少前台-2/托雅前台-2：-map 0 超时，-map 0:v:0 约 5s 成功。
-            # 这与 AAC 编码本身无关，是回放多轨转发问题；现场有图有声仍会误报。
+            # 真机前端相机-1/前端相机-2：-map 0 超时，-map 0:v:0 约 5s 成功。
+            # 音频改独立短拉 -map 0:a:0，不与视频捆在一次全流里。
             min_ok = 8 * 1024
             partial_ok = 24 * 1024
             for label, rtsp in ordered:
@@ -435,7 +772,7 @@ class AVProbeMixin:
                         os.truncate(tmp_path, 0)
                     except OSError:
                         pass
-                if label == "original":
+                if label.startswith("original"):
                     timeout = self.av_seconds + 25
                     sock_us = 12_000_000
                 else:
@@ -459,12 +796,14 @@ class AVProbeMixin:
                     if size >= min_ok and (
                         proc.returncode == 0 or size >= partial_ok
                     ):
+                        used_video = (label, rtsp)
                         break
                     err_lines = (proc.stderr or "").strip().splitlines()
                     last_err = err_lines[-1] if err_lines else f"rc={proc.returncode}"
                 except subprocess.TimeoutExpired:
                     size = os.path.getsize(tmp_path) if os.path.exists(tmp_path) else 0
                     if size >= partial_ok:
+                        used_video = (label, rtsp)
                         break
                     last_err = f"拉流超时({label},{timeout}s)"
                     continue
@@ -506,8 +845,6 @@ class AVProbeMixin:
             data = json.loads(p2.stdout or "{}")
             streams = data.get("streams") or []
             vstreams = [s for s in streams if s.get("codec_type") == "video"]
-            # 策略上只拉视频轨，文件内通常无音频；不以「无音频轨」判异常
-            astreams = [s for s in streams if s.get("codec_type") == "audio"]
 
             if vstreams:
                 vs = vstreams[0]
@@ -523,37 +860,22 @@ class AVProbeMixin:
                 result["视频抽检"] = "异常"
                 result["抽检详情"] = "无视频轨"
 
-            if astreams:
-                as_ = astreams[0]
-                result["audio_codec"] = as_.get("codec_name")
-                result["音频抽检"] = "正常"
-                if expect_audio is not False:
-                    vol_cmd = [
-                        ffmpeg, "-hide_banner", "-nostats",
-                        "-i", tmp_path,
-                        "-t", str(min(self.av_seconds, 5)),
-                        "-af", "volumedetect",
-                        "-f", "null", "-",
-                    ]
-                    vp = subprocess.run(
-                        vol_cmd, capture_output=True, text=True, timeout=40
-                    )
-                    mean_m = re.search(
-                        r"mean_volume:\s*([-\d.]+)\s*dB",
-                        vp.stderr or "",
-                    )
-                    if mean_m:
-                        mean_db = float(mean_m.group(1))
-                        result["mean_volume_db"] = mean_db
-                        if mean_db <= self.silence_db:
-                            result["音频抽检"] = "警告"
-                            extra = f"疑似静音(mean {mean_db:.1f}dB)"
-                            result["抽检详情"] = (
-                                f"{result['抽检详情']}; {extra}" if result["抽检详情"]
-                                else extra
-                            )
+            audio_note = ""
+            if result["视频抽检"] == "正常":
+                audio_cands: List[Tuple[str, str]] = []
+                if used_video:
+                    audio_cands.append(used_video)
+                for item in ordered:
+                    if not used_video or item[1] != used_video[1]:
+                        audio_cands.append(item)
+                ares = self._probe_audio_track(
+                    ffmpeg, ffprobe, audio_cands, expect_audio
+                )
+                result["音频抽检"] = ares.get("音频抽检", "未知")
+                result["audio_codec"] = ares.get("audio_codec")
+                result["mean_volume_db"] = ares.get("mean_volume_db")
+                audio_note = ares.get("note") or ""
             else:
-                # 仅视频策略：音频不二次拉流（易超时误报），配置有音频也标跳过
                 result["音频抽检"] = "跳过"
 
             if result["视频抽检"] == "正常":
@@ -573,6 +895,12 @@ class AVProbeMixin:
                         if m:
                             prefix = f"短时抽检OK@{m.group(1).strip()}"
                     result["抽检详情"] = (prefix + " " + " ".join(parts)).strip()
+                if audio_note:
+                    result["抽检详情"] = (
+                        f"{result['抽检详情']}; {audio_note}"
+                        if result["抽检详情"]
+                        else audio_note
+                    )
 
             # 成功拉到有效片段后,可选保存到项目目录
             if self.av_save and size >= 1024:
@@ -613,10 +941,102 @@ class AVProbeMixin:
                 except OSError:
                     pass
 
+    def _probe_channel_at(
+        self,
+        rec: Dict,
+        clip_s: datetime,
+        clip_e: datetime,
+        sample_label: str,
+    ) -> Tuple[str, Dict]:
+        """在指定时段检索回放并做短时抽检。"""
+        self._check_cancel()
+        tid = str(rec["track_id"])
+        found = self._search_track_in_range(tid, clip_s, clip_e)
+        uri = found.get("playback_uri") or rec.get("playback_uri")
+        seg_s = found.get("seg_start") if found.get("ok") else rec.get("seg_start")
+        seg_e = found.get("seg_end") if found.get("ok") else rec.get("seg_end")
+        use_clip = (clip_s, clip_e) if found.get("ok") else (None, None)
+        label = sample_label if found.get("ok") else (
+            sample_label + "; 繁忙时段未命中,回退近期片段"
+        )
+        if not uri:
+            return tid, {
+                "视频抽检": "跳过",
+                "音频抽检": "跳过",
+                "抽检详情": found.get("detail") or "无回放URI",
+                "抽检时段": label,
+                "保存路径": None,
+            }
+        res = self._probe_track_av(
+            track_id=tid,
+            playback_uri=uri,
+            seg_start=seg_s,
+            seg_end=seg_e,
+            expect_audio=rec.get("录像含音频"),
+            clip_start=use_clip[0],
+            clip_end=use_clip[1],
+            sample_label=label,
+            channel=str(rec.get("通道") or ""),
+            name=str(rec.get("名称") or ""),
+            save_clip_start=use_clip[0] or clip_s,
+        )
+        return tid, res
+
+    def _run_av_jobs(
+        self,
+        recs: List[Dict],
+        clip_s: datetime,
+        clip_e: datetime,
+        sample_label: str,
+        progress_lo: float,
+        progress_hi: float,
+        progress_text: str,
+    ) -> Dict[int, Dict]:
+        results: Dict[int, Dict] = {}
+        total_av = len(recs)
+        if total_av == 0:
+            return results
+        done_av = 0
+        pool = ThreadPoolExecutor(max_workers=self.av_workers)
+        try:
+            # 结果按 id(rec) 建键:track_id 可能重复或为「未知」(Track 缺 id/Channel),
+            # 按 track_id 建键会让重复项互相覆盖、结论挂到别的通道上。
+            futs = {
+                pool.submit(self._probe_channel_at, r, clip_s, clip_e, sample_label): r
+                for r in recs
+            }
+            for fut in as_completed(futs):
+                _tid, res = fut.result()
+                results[id(futs[fut])] = res
+                done_av += 1
+                frac = done_av / total_av
+                overall = progress_lo + (progress_hi - progress_lo) * frac
+                if (
+                    done_av == 1
+                    or done_av == total_av
+                    or done_av % max(1, total_av // 20) == 0
+                ):
+                    self._progress(
+                        f"{progress_text} {done_av}/{total_av}",
+                        current=done_av,
+                        total=total_av,
+                        phase="deep",
+                        overall=overall,
+                    )
+        except ScanCancelled:
+            pool.shutdown(wait=False, cancel_futures=True)
+            raise
+        except BaseException:
+            pool.shutdown(wait=False, cancel_futures=True)
+            raise
+        pool.shutdown(wait=True)
+        return results
+
     def _run_deep_av_checks(self, records: List[Dict]) -> None:
         """对通道做短时音视频抽检(低并发,默认仅落盘正常的通道)。
 
         抽检时间优先落在繁忙时段(默认本地 10:00-18:00),人流较多便于验证音视频。
+        初检异常的通道会换一个时段再抽一次。
         """
         if not self.deep_av_check:
             for r in records:
@@ -645,115 +1065,186 @@ class AVProbeMixin:
                     r["音频抽检"] = "跳过"
                     r["抽检详情"] = "跳过"
 
+        if self.av_channels is not None:
+            # 过滤发生在非候选标记之后、av_limit 之前：
+            #   - 在「未配置录像/落盘异常」之后 —— 那些是更值得用户看的真实问题，
+            #     不该被「不在抽检列表」掩盖；
+            #   - 在 av_limit 之前 —— `--av-channels 31,64 --av-limit 2` 的语义
+            #     是「在 31/64 里最多抽 2 路」，而不是先按上限截断再过滤。
+            kept, outside = [], []
+            for r in candidates:
+                if _to_int(str(r.get("通道") or ""), default=0) in self.av_channels:
+                    kept.append(r)
+                else:
+                    outside.append(r)
+            candidates = kept
+            for r in outside:
+                r["视频抽检"] = "跳过"
+                r["音频抽检"] = "跳过"
+                r["抽检详情"] = "不在指定抽检通道列表"
+
         if self.av_limit is not None:
             overflow = candidates[self.av_limit:]
             candidates = candidates[: self.av_limit]
-            # 被截掉的通道补打标记,避免残留「未启用深度抽检」误导
             for r in overflow:
                 r["视频抽检"] = "跳过"
                 r["音频抽检"] = "跳过"
                 r["抽检详情"] = f"超出抽检路数上限({self.av_limit})"
 
         if not candidates:
-            self._log("深度抽检: 无可用通道(需近期有录像)")
+            if self.av_channels is not None:
+                self._log(
+                    "深度抽检: 指定通道"
+                    f"(通道 {'、'.join(str(c) for c in sorted(self.av_channels))})"
+                    "中没有近期落盘正常的通道"
+                )
+            else:
+                self._log("深度抽检: 无可用通道(需近期有录像)")
             return
 
-        clip_s, clip_e, sample_label = self._pick_busy_clip_times(self.av_seconds)
         save_dir = self._prepare_av_save_dir() if self.av_save else None
         self._log(
-            f"深度音视频抽检: {len(candidates)} 通道 × {self.av_seconds}s RTSP"
-            f", 并发 {self.av_workers} (仅短时回放,不写NVR盘)"
+            f"深度音视频抽检: {len(candidates)} 通道 × {self.av_seconds}s 视频"
+            f" + 独立音频轨, 并发 {self.av_workers} (仅短时回放,不写NVR盘)"
         )
-        self._log(f"优先时段: {sample_label}")
+        if self.av_channels is not None:
+            self._log(
+                "抽检通道过滤: 仅 "
+                + "、".join(str(c) for c in sorted(self.av_channels))
+            )
         if save_dir:
             self._log(f"片段保存目录: {save_dir}")
 
-        def _job(rec: Dict) -> Tuple[str, Dict]:
-            self._check_cancel()
-            tid = str(rec["track_id"])
-            # 在繁忙时段窗口检索回放URI
-            found = self._search_track_in_range(tid, clip_s, clip_e)
-            uri = found.get("playback_uri") or rec.get("playback_uri")
-            seg_s = found.get("seg_start") if found.get("ok") else rec.get("seg_start")
-            seg_e = found.get("seg_end") if found.get("ok") else rec.get("seg_end")
-            use_clip = (clip_s, clip_e) if found.get("ok") else (None, None)
-            label = sample_label if found.get("ok") else (
-                sample_label + "; 繁忙时段未命中,回退近期片段"
-            )
-            if not uri:
-                return tid, {
-                    "视频抽检": "跳过",
-                    "音频抽检": "跳过",
-                    "抽检详情": found.get("detail") or "无回放URI",
-                    "抽检时段": label,
-                    "保存路径": None,
-                }
-            res = self._probe_track_av(
-                track_id=tid,
-                playback_uri=uri,
-                seg_start=seg_s,
-                seg_end=seg_e,
-                expect_audio=rec.get("录像含音频"),
-                clip_start=use_clip[0],
-                clip_end=use_clip[1],
-                sample_label=label,
-                channel=str(rec.get("通道") or ""),
-                name=str(rec.get("名称") or ""),
-                save_clip_start=use_clip[0] or clip_s,
-            )
-            return tid, res
+        # 预热设备时区:抽检线程池内 _search_track_in_range 会用到,
+        # 先在主线程解析好,避免多线程同时触发 /System/status 探测
+        self._get_device_tz()
 
-        results: Dict[str, Dict] = {}
-        total_av = len(candidates)
-        done_av = 0
-        # 深度抽检约占总进度 70%→96%
-        deep_lo, deep_hi = 0.70, 0.96
-        pool = ThreadPoolExecutor(max_workers=self.av_workers)
-        try:
-            futs = [pool.submit(_job, r) for r in candidates]
-            for fut in as_completed(futs):
-                tid, res = fut.result()
-                results[tid] = res
-                done_av += 1
-                frac = done_av / total_av if total_av else 1.0
-                overall = deep_lo + (deep_hi - deep_lo) * frac
-                # 节流：每完成 1 路或每 5% 汇报，保证进度条跟手
-                if (
-                    done_av == 1
-                    or done_av == total_av
-                    or done_av % max(1, total_av // 20) == 0
-                ):
-                    self._progress(
-                        f"深度抽检 {done_av}/{total_av}",
-                        current=done_av,
-                        total=total_av,
-                        phase="deep",
-                        overall=overall,
+        if getattr(self, "av_at", None):
+            # 定点模式(--av-at): 每个时刻各查一遍全部候选通道,
+            # 用于区分「持久故障」与「间歇抖动」(多时刻都未知 → 先怀疑 IPC 端)。
+            # 最终结论: 有明确结论的窗口优先、再取严重度最低的一窗;
+            # 「多时刻」轨迹写进抽检详情,不静默。
+            instants = list(self.av_at)
+            n = len(instants)
+            span = (0.90 - 0.70) / n
+            # 同样按 id(rec) 建键,理由见 _run_av_jobs
+            merged: Dict[int, Dict] = {}
+            best_label: Dict[int, str] = {}
+            notes: Dict[int, List[str]] = {}
+            for idx, at_dt in enumerate(instants):
+                clip_s, clip_e, sample_label = self._pick_busy_clip_times(
+                    self.av_seconds, at=at_dt
+                )
+                self._log(f"定点抽检 [{idx + 1}/{n}] {sample_label}")
+                res = self._run_av_jobs(
+                    candidates, clip_s, clip_e, sample_label,
+                    0.70 + span * idx, 0.70 + span * (idx + 1),
+                    "深度抽检" if n == 1 else f"定点抽检 {idx + 1}/{n}",
+                )
+                for r in candidates:
+                    key = id(r)
+                    new = res.get(key)
+                    if not new:
+                        continue
+                    notes.setdefault(key, []).append(
+                        f"{clip_s.astimezone().strftime('%H:%M')}"
+                        f"={new.get('视频抽检', '未知')}/{new.get('音频抽检', '未知')}"
                     )
-        except ScanCancelled:
-            # 排队任务立即撤号;正在拉流的路由 _run_cancellable kill ffmpeg
-            pool.shutdown(wait=False, cancel_futures=True)
-            raise
-        except BaseException:
-            pool.shutdown(wait=False, cancel_futures=True)
-            raise
-        pool.shutdown(wait=True)
+                    cur = merged.get(key)
+                    if cur is None or _at_window_rank(
+                        new.get("视频抽检"), new.get("音频抽检")
+                    ) < _at_window_rank(
+                        cur.get("视频抽检"), cur.get("音频抽检")
+                    ):
+                        merged[key] = new
+                        best_label[key] = sample_label
+            for r in candidates:
+                key = id(r)
+                _apply_av_result(r, merged.get(key, {}), best_label.get(key, ""))
+                ns = notes.get(key) or []
+                if len(ns) > 1:
+                    extra = "多时刻: " + "; ".join(ns)
+                    r["抽检详情"] = (
+                        f"{extra}; {r['抽检详情']}" if r.get("抽检详情") else extra
+                    )
+        else:
+            clip_s, clip_e, sample_label = self._pick_busy_clip_times(self.av_seconds)
+            self._log(f"优先时段: {sample_label}")
+            results = self._run_av_jobs(
+                candidates, clip_s, clip_e, sample_label,
+                0.70, 0.90, "深度抽检",
+            )
+            for r in candidates:
+                _apply_av_result(r, results.get(id(r), {}), sample_label)
 
-        saved_n = 0
-        for r in candidates:
-            res = results.get(str(r["track_id"]), {})
-            r["视频抽检"] = res.get("视频抽检", "未知")
-            r["音频抽检"] = res.get("音频抽检", "未知")
-            r["抽检详情"] = res.get("抽检详情", "")
-            r["抽检时段"] = res.get("抽检时段", sample_label)
-            r["video_codec"] = res.get("video_codec")
-            r["audio_codec"] = res.get("audio_codec")
-            r["resolution"] = res.get("resolution")
-            r["mean_volume_db"] = res.get("mean_volume_db")
-            r["保存路径"] = res.get("保存路径")
-            if r.get("保存路径"):
-                saved_n += 1
+        retry_recs = [r for r in candidates if av_needs_retry(r)]
+        retry_ok = 0
+        if retry_recs and getattr(self, "av_at", None):
+            # 定点模式不自动换时段:再随机挑一段反而偏离「查指定时刻」的本意;
+            # 补测手段就是多给几个 --av-at 时刻。
+            self._log(
+                f"定点模式: {len(retry_recs)} 路仍异常/未确认,"
+                "不自动换时段复检(需补测可增加 --av-at 时刻)"
+            )
+            self._progress("深度抽检完成", phase="deep", overall=0.96)
+        elif retry_recs:
+            retry = self._pick_retry_clip_times(self.av_seconds, clip_s, clip_e)
+            if retry is None:
+                self._log(
+                    f"初检异常 {len(retry_recs)} 路, 繁忙窗内无合适换时段,跳过复检"
+                )
+                self._progress("深度抽检完成", phase="deep", overall=0.96)
+            else:
+                r_s, r_e, r_label = retry
+                names = "、".join(
+                    str(r.get("通道") or r.get("track_id"))
+                    + (
+                        f"({r['名称']})"
+                        if r.get("名称") and r.get("名称") != "未知"
+                        else ""
+                    )
+                    for r in retry_recs[:8]
+                )
+                more = f" 等{len(retry_recs)}路" if len(retry_recs) > 8 else ""
+                self._log(
+                    f"初检异常 {len(retry_recs)} 路, 换时段复检: {names}{more}"
+                )
+                self._log(f"复检时段: {r_label}")
+                retry_map = self._run_av_jobs(
+                    retry_recs, r_s, r_e, r_label,
+                    0.90, 0.96, "异常复检",
+                )
+                for r in retry_recs:
+                    new = retry_map.get(id(r))
+                    if not new:
+                        continue
+                    old_v, old_a = r.get("视频抽检"), r.get("音频抽检")
+                    old_detail = r.get("抽检详情") or ""
+                    if _av_severity(
+                        new.get("视频抽检"), new.get("音频抽检")
+                    ) < _av_severity(old_v, old_a):
+                        _apply_av_result(r, new, r_label)
+                        extra = "复检通过,初检失败"
+                        r["抽检详情"] = (
+                            f"{r.get('抽检详情')}; {extra}"
+                            if r.get("抽检详情")
+                            else extra
+                        )
+                        retry_ok += 1
+                    else:
+                        stamp = r_s.astimezone().strftime("%H:%M:%S")
+                        note = new.get("抽检详情") or "仍异常"
+                        r["抽检详情"] = (
+                            f"{old_detail}; 复检@{stamp}仍异常({note})"
+                            if old_detail
+                            else f"复检@{stamp}仍异常({note})"
+                        )
+                still = len(retry_recs) - retry_ok
+                self._log(f"复检通过 {retry_ok} 路, 仍异常 {still} 路")
+        else:
+            self._progress("深度抽检完成", phase="deep", overall=0.96)
 
+        saved_n = sum(1 for r in candidates if r.get("保存路径"))
         if self.av_save:
             if save_dir and saved_n:
                 self._log(f"已保存 {saved_n} 个抽检片段 → {save_dir}")

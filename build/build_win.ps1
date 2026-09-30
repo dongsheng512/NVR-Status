@@ -23,8 +23,8 @@ if ($Lite -or $env:NVR_LITE -eq "1" -or $env:NVR_BUNDLE_FFMPEG -eq "0") {
 }
 
 Write-Host "==> 安装依赖"
+# pyinstaller 在 dev 依赖组里,uv sync 会一并装好
 uv sync
-uv pip install "pyinstaller>=6.0.0"
 
 Write-Host "==> PyInstaller"
 uv run pyinstaller --noconfirm NVRStatus.spec

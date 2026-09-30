@@ -13,7 +13,14 @@ from datetime import datetime, timedelta, timezone
 from html import unescape
 from typing import Dict, List, Optional, Tuple
 
-from nvr_core.util import _parse_hik_time, _to_int
+from nvr_core.util import (
+    AV_SAMPLE_MIN_AGE,
+    ScanCancelled,
+    _parse_hik_time,
+    _to_int,
+    alternate_clip_times,
+    latest_av_sample_instant,
+)
 
 
 class RecordingMixin:
@@ -27,14 +34,19 @@ class RecordingMixin:
 
     @staticmethod
     def _physical_channel(tr: ET.Element) -> str:
-        """从 Track 节点解析物理通道号(优先 SrcChannel)。"""
+        """从 Track 节点解析物理通道号(优先 SrcChannel)。
+
+        Track 的 id/Channel 常见编码为「物理通道 + 两位码流号」:
+        101/102 = 通道 1 的主/子码流, 201/202 = 通道 2, 6401/6402 = 通道 64。
+        统一取高位作物理通道号, 使同一通道的主/子码流归为一组;
+        低位不是 01/02 时(如通道号本身 >= 100)原样返回, 避免误并。
+        """
         src = tr.findtext(".//SrcChannel")
         if src:
-            return src
-        raw = tr.findtext("Channel") or tr.findtext("id") or "未知"
+            return str(src).strip()
+        raw = (tr.findtext("Channel") or tr.findtext("id") or "未知").strip()
         tid = _to_int(raw, default=-1)
-        # 主码流 track 常见编码: 101/201/.../6401 -> 通道 1/2/.../64
-        if tid >= 100 and tid % 100 == 1:
+        if tid >= 100 and tid % 100 in (1, 2):
             return str(tid // 100)
         return raw
 
@@ -343,13 +355,20 @@ class RecordingMixin:
         today_s, today_e = day_window(local)
 
         if today_s <= local < today_e:
-            win_s, win_e = today_s, min(local - timedelta(seconds=30), today_e)
+            # 窗口右沿距现在至少 10 分钟，避免抽到刚写入的回放
+            win_s, win_e = today_s, min(local - AV_SAMPLE_MIN_AGE, today_e)
             if win_e <= win_s:
-                win_e = min(today_e, win_s + timedelta(minutes=5))
-            label = (
-                f"今日 {win_s.strftime('%H:%M')}-{win_e.strftime('%H:%M')} "
-                f"(繁忙时段 {sh:02d}:00-{eh:02d}:00)"
-            )
+                yday = local - timedelta(days=1)
+                win_s, win_e = day_window(yday)
+                label = (
+                    f"昨日 {win_s.strftime('%m-%d %H:%M')}-{win_e.strftime('%H:%M')} "
+                    f"(今日繁忙可抽检窗不足10分钟)"
+                )
+            else:
+                label = (
+                    f"今日 {win_s.strftime('%H:%M')}-{win_e.strftime('%H:%M')} "
+                    f"(繁忙时段 {sh:02d}:00-{eh:02d}:00, 距现在≥10分钟)"
+                )
         elif local < today_s:
             yday = local - timedelta(days=1)
             win_s, win_e = day_window(yday)
@@ -370,14 +389,21 @@ class RecordingMixin:
             label,
         )
 
-    def _pick_busy_clip_times(self, seconds: int) -> Tuple[datetime, datetime, str]:
+    def _pick_busy_clip_times(
+        self, seconds: int, at: Optional[datetime] = None
+    ) -> Tuple[datetime, datetime, str]:
         """在繁忙时段窗口内选取短抽检起止时间(UTC)。
 
         优先取窗口内接近 14:00 的人流高峰;若当前在繁忙时段且已过 14:00,
-        则取窗口末尾附近(更接近现在且仍在繁忙段)。
+        则取窗口末尾(该末尾已距现在至少 10 分钟)。
+
+        定点模式(`--av-at` / `av_at`,或显式传 `at`):忽略繁忙窗,直接钉在指定时刻。
+        指定时刻距现在不足 10 分钟时**前移**到「现在−10分钟」—— 刚写入的回放
+        易 RTSP 超时;前移会在标签里写明,不静默。
         """
         win_s, win_e, label = self._busy_hours_window()
         local = datetime.now().astimezone()
+        cutoff = latest_av_sample_instant()
         # 目标锚点: 本地 14:00
         peak_local = local.replace(hour=14, minute=0, second=0, microsecond=0)
         # 若窗口是昨天, peak 也落在昨天
@@ -387,25 +413,76 @@ class RecordingMixin:
         peak = peak_local.astimezone(timezone.utc)
 
         sec = max(3, seconds)
+
+        at_dt = at if at is not None else (
+            self.av_at[0] if getattr(self, "av_at", None) else None
+        )
+        if at_dt is not None:
+            at_s = at_dt.astimezone()
+            want_e = at_s + timedelta(seconds=sec)
+            clip_e = min(want_e, cutoff)
+            clip_s = clip_e - timedelta(seconds=sec)
+            # 被前移时把「请求的时刻 → 实际抽检点」都写出来，
+            # 只写实际点会让人以为查的就是那个时刻（不静默原则）。
+            head = "定点抽检 " + at_s.strftime("%m-%d %H:%M:%S")
+            if clip_e < want_e:
+                mins = int(AV_SAMPLE_MIN_AGE.total_seconds() // 60)
+                head += f"(距现在不足{mins}分钟,已前移至 "
+            else:
+                head += "(抽检点 "
+            return (
+                clip_s,
+                clip_e,
+                head + clip_s.astimezone().strftime("%m-%d %H:%M:%S") + ")",
+            )
+
         if win_s <= peak <= win_e:
-            clip_e = min(peak + timedelta(seconds=sec), win_e)
+            clip_e = min(peak + timedelta(seconds=sec), win_e, cutoff)
             clip_s = clip_e - timedelta(seconds=sec)
             if clip_s < win_s:
                 clip_s = win_s
-                clip_e = min(win_e, clip_s + timedelta(seconds=sec))
+                clip_e = min(win_e, cutoff, clip_s + timedelta(seconds=sec))
             where = "14:00附近"
         else:
-            # 取窗口末尾(当前在繁忙时段时即接近现在)
-            clip_e = win_e
+            clip_e = min(win_e, cutoff)
             clip_s = clip_e - timedelta(seconds=sec)
             if clip_s < win_s:
                 clip_s = win_s
-                clip_e = min(win_e, clip_s + timedelta(seconds=sec))
+                clip_e = min(win_e, cutoff, clip_s + timedelta(seconds=sec))
             where = "时段末尾"
+
+        if clip_e > cutoff:
+            clip_e = cutoff
+            clip_s = clip_e - timedelta(seconds=sec)
 
         clip_label = (
             f"{label}; 抽检点 {clip_s.astimezone().strftime('%m-%d %H:%M:%S')}"
             f"({where})"
+        )
+        return clip_s, clip_e, clip_label
+
+    def _pick_retry_clip_times(
+        self,
+        seconds: int,
+        avoid_s: datetime,
+        avoid_e: datetime,
+    ) -> Optional[Tuple[datetime, datetime, str]]:
+        """初检失败后，在同一繁忙窗内另选一个时段。
+
+        定点模式(`av_at`)返回 None:额外时刻已按用户指定的顺序逐个检查过,
+        再自动换一个随机时段反而偏离「查指定时刻」的本意。
+        """
+        if getattr(self, "av_at", None):
+            return None
+        win_s, win_e, label = self._busy_hours_window()
+        cutoff = latest_av_sample_instant()
+        alt = alternate_clip_times(win_s, win_e, seconds, avoid_s, cutoff)
+        if not alt:
+            return None
+        clip_s, clip_e = alt
+        clip_label = (
+            f"{label}; 复检点 {clip_s.astimezone().strftime('%m-%d %H:%M:%S')}"
+            f"(换时段)"
         )
         return clip_s, clip_e, clip_label
 
@@ -531,6 +608,27 @@ class RecordingMixin:
                 "录像是否正常": None,  # 综合后填充
             })
 
+        # 同一物理通道可能返回主/子码流多条 Track:按通道合并, 只保留主码流
+        # (track_id 最小的一条)。否则通道表会出现同一摄像头重复行, 指标分母
+        # 被放大, 且对子码流多做一遍无意义的 CMSearch。
+        # 通道号解析不出来时(非数字)不参与合并, 避免把不同摄像头误并成一行。
+        merged: Dict[str, Dict] = {}
+        unparsed: List[Dict] = []
+        for r in records:
+            key = str(r.get("通道") or "")
+            if not key.isdigit():
+                unparsed.append(r)
+                continue
+            cur = merged.get(key)
+            if cur is None or _to_int(r.get("track_id"), default=1 << 30) < _to_int(
+                cur.get("track_id"), default=1 << 30
+            ):
+                merged[key] = r
+        merged_n = len(records) - len(merged) - len(unparsed)
+        records = list(merged.values()) + unparsed
+        if merged_n > 0:
+            self._log(f"已按物理通道合并 {merged_n} 条重复码流轨道")
+
         records.sort(key=lambda r: _to_int(r["通道"], default=1 << 30))
 
         # 深度抽检依赖 URI,若开启则强制做落盘检索
@@ -543,8 +641,9 @@ class RecordingMixin:
         if need_search and records:
             # 未配置录像的通道不做检索:省请求,也避免取消时被排队任务拖住
             to_search = [r for r in records if r["已启用录像"]]
+            search_ids = {id(r) for r in to_search}
             for r in records:
-                if r not in to_search:
+                if id(r) not in search_ids:
                     r["落盘状态"] = "跳过"
                     r["落盘详情"] = "未配置录像计划"
 
@@ -560,19 +659,27 @@ class RecordingMixin:
                 phase="disk",
                 overall=disk_lo,
             )
-            results: Dict[str, Dict] = {}
+            results: Dict[int, Dict] = {}
 
-            def _job(tid: str) -> Tuple[str, Dict]:
+            def _job(rec: Dict) -> Tuple[int, Dict]:
                 self._check_cancel()
-                return tid, self._search_track_recent(tid, self.lookback_minutes)
+                return id(rec), self._search_track_recent(
+                    rec["track_id"], self.lookback_minutes
+                )
+
+            # 预热设备时区:线程池内 _search_track_recent 会用到,
+            # 先在主线程解析好,避免多线程同时触发 /System/status 探测
+            self._get_device_tz()
 
             done_n = 0
             pool = ThreadPoolExecutor(max_workers=self.search_workers)
             try:
-                futures = [pool.submit(_job, r["track_id"]) for r in to_search]
+                # 以 id(rec) 而非 track_id 作结果键:偶发固件会返回重复/「未知」
+                # track_id, 用 track_id 会让两条记录的落盘结论互相覆盖。
+                futures = [pool.submit(_job, r) for r in to_search]
                 for fut in as_completed(futures):
-                    tid, res = fut.result()
-                    results[tid] = res
+                    key, res = fut.result()
+                    results[key] = res
                     done_n += 1
                     frac = done_n / total_n if total_n else 1.0
                     overall = disk_lo + (disk_hi - disk_lo) * frac
@@ -599,7 +706,7 @@ class RecordingMixin:
             pool.shutdown(wait=True)
 
             for r in records:
-                res = results.get(r["track_id"], {
+                res = results.get(id(r), {
                     "ok": False,
                     "status": "未知",
                     "detail": "未返回结果",

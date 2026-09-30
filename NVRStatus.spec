@@ -289,7 +289,7 @@ if sys.platform == 'darwin':
         bundle_identifier='com.local.nvrstatus',
         info_plist={
             'NSHighResolutionCapable': True,
-            'CFBundleShortVersionString': '2.2.0',
+            'CFBundleShortVersionString': '2.3.0',
             'CFBundleName': 'NVRStatus',
             'CFBundleDisplayName': 'NVR 状态巡检',
         },

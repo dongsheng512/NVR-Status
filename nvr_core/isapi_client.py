@@ -23,6 +23,8 @@ from nvr_core.util import (
     _to_float,
     _to_int,
     _which_tools,
+    parse_channel_list,
+    parse_instant_list,
 )
 
 
@@ -49,6 +51,8 @@ class ISAPIClient:
         av_seconds: int = 6,
         av_workers: int = 2,
         av_limit: Optional[int] = None,
+        av_channels=None,
+        av_at=None,
         silence_db: float = -80.0,
         busy_start_hour: int = 10,
         busy_end_hour: int = 18,
@@ -77,6 +81,8 @@ class ISAPIClient:
         self.av_seconds = max(3, min(int(av_seconds), self.AV_SECONDS_MAX))
         self.av_workers = max(1, min(int(av_workers), self.AV_WORKERS_MAX))
         self.av_limit = av_limit if av_limit is None or av_limit > 0 else None
+        # 只抽检指定通道(物理通道号);None = 不做过滤,全部候选通道都抽
+        self.av_channels = parse_channel_list(av_channels)
         self.silence_db = silence_db
         # 抽检优先时段(本地时间):默认 10:00-18:00 人流较多
         self.busy_start_hour = max(0, min(23, int(busy_start_hour)))
@@ -85,6 +91,9 @@ class ISAPIClient:
             self.busy_start_hour, self.busy_end_hour = 10, 18
         # 0=今天, 1=昨天, … 指定抽检落在哪一天的繁忙时段
         self.busy_days_ago = max(0, min(30, int(busy_days_ago)))
+        # 定点抽检时刻(本地 HH:MM,可多个);None = 沿用繁忙时段逻辑。
+        # 依赖 busy_days_ago:时刻落在「N 天前」的当天(与 --busy-days-ago 同口径)。
+        self.av_at = parse_instant_list(av_at, days_ago=self.busy_days_ago)
         # 保存抽检片段:默认不保存;开启后写入 项目/av_samples/<时间戳>/
         self.av_save = bool(av_save)
         if self.av_save and not self.deep_av_check:
@@ -121,6 +130,12 @@ class ISAPIClient:
         self._cameras_cache: Optional[List[Dict]] = None
         self._tools = _which_tools()
         self._save_lock = threading.Lock()
+        # CMSearch / 深度抽检的线程池会并发触达 _parse(经 _get_device_tz)，
+        # 而 requests.Session 非线程安全、"查缓存→请求→写缓存" 亦非原子：
+        # 用 _cache_lock 保证缓存读写原子，_tz_lock 保证时区只探测一次。
+        # _cache_lock 用 RLock:持锁期间的失败提示会走进度回调,允许同线程重入。
+        self._cache_lock = threading.RLock()
+        self._tz_lock = threading.Lock()
         # 设备时区缓存(从设备时间串解析,默认东八区)
         self._device_tz: Optional[timezone] = None
 
@@ -203,23 +218,31 @@ class ISAPIClient:
 
         仅在成功解析设备偏移时缓存;回退值不缓存,网络恢复后可重试,
         避免本机时区错误被固化为后续 RTSP 时间改写的基准。
+
+        加 _tz_lock 双重检查:线程池内多线程同时首次调用时,只让一个线程
+        真正去探测 /System/status,避免共享 Session 并发与非原子缓存的竞态。
         """
         if self._device_tz is not None:
             return self._device_tz
-        # 尝试设备状态里的 currentDeviceTime, 如 2026-07-29T12:36:13+08:00
-        try:
-            status = self.get_system_status()
-            raw = status.get("当前时间") or ""
-            m = re.search(r"([+-])(\d{2}):(\d{2})$", raw)
-            if m:
-                sign = 1 if m.group(1) == "+" else -1
-                hours = int(m.group(2))
-                mins = int(m.group(3))
-                self._device_tz = timezone(sign * timedelta(hours=hours, minutes=mins))
+        with self._tz_lock:
+            # 双重检查:等锁期间可能已被别的线程探测成功
+            if self._device_tz is not None:
                 return self._device_tz
-        except Exception:
-            pass
+            # 尝试设备状态里的 currentDeviceTime, 如 2026-07-29T12:36:13+08:00
+            try:
+                status = self.get_system_status()
+                raw = status.get("当前时间") or ""
+                m = re.search(r"([+-])(\d{2}):(\d{2})$", raw)
+                if m:
+                    sign = 1 if m.group(1) == "+" else -1
+                    hours = int(m.group(2))
+                    mins = int(m.group(3))
+                    self._device_tz = timezone(sign * timedelta(hours=hours, minutes=mins))
+                    return self._device_tz
+            except Exception:
+                pass
         # 回退:本机本地时区(通常与设备同在东八区),不缓存
+        # 在锁外返回,后续调用仍可重试(与缓存语义一致)
         local = datetime.now().astimezone()
         return local.tzinfo if local.tzinfo else timezone(timedelta(hours=8))
 
@@ -332,38 +355,43 @@ class ISAPIClient:
 
         仅「确定性失败」入负缓存(HTTP 非200=端点不支持、解析失败);
         瞬时网络失败(超时等)不缓存,后续调用可重试。
+
+        整段在 _cache_lock 内执行:并发调用同一端点时只发一次请求,
+        且避免多线程同时读写共享 Session。
         """
-        if endpoint in self._cache:
-            return self._cache[endpoint]
-        text = self._get(endpoint, tag)
-        if text is None:
-            # 瞬时失败:不入缓存
-            return None
-        root: Optional[ET.Element]
-        if not text:
-            root = None
-        else:
-            # 移除命名空间以便于解析
-            text = re.sub(r'\s+xmlns="[^"]+"', '', text)
-            root = self._safe_fromstring(text, tag or endpoint)
-        self._cache[endpoint] = root
-        return root
+        with self._cache_lock:
+            if endpoint in self._cache:
+                return self._cache[endpoint]
+            text = self._get(endpoint, tag)
+            if text is None:
+                # 瞬时失败:不入缓存
+                return None
+            root: Optional[ET.Element]
+            if not text:
+                root = None
+            else:
+                # 移除命名空间以便于解析
+                text = re.sub(r'\s+xmlns="[^"]+"', '', text)
+                root = self._safe_fromstring(text, tag or endpoint)
+            self._cache[endpoint] = root
+            return root
 
     def _parse_endpoint_quiet(self, endpoint: str) -> Optional[ET.Element]:
         """静默解析端点（不打失败日志），用于能力探测。"""
-        if endpoint in self._cache:
-            return self._cache[endpoint]
-        text = self._get(endpoint, tag="", quiet=True)
-        if text is None:
-            return None
-        root: Optional[ET.Element]
-        if not text:
-            root = None
-        else:
-            text = re.sub(r'\s+xmlns="[^"]+"', "", text)
-            root = self._safe_fromstring(text)
-        self._cache[endpoint] = root
-        return root
+        with self._cache_lock:
+            if endpoint in self._cache:
+                return self._cache[endpoint]
+            text = self._get(endpoint, tag="", quiet=True)
+            if text is None:
+                return None
+            root: Optional[ET.Element]
+            if not text:
+                root = None
+            else:
+                text = re.sub(r'\s+xmlns="[^"]+"', "", text)
+                root = self._safe_fromstring(text)
+            self._cache[endpoint] = root
+            return root
 
     # ---------- 设备基础信息 ----------
 

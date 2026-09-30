@@ -52,12 +52,12 @@ from ui.panels.results_panel import (
     ResultsExpandWindow,
     ResultsPanel,
 )
-from ui.scan_worker import QueueScanWorker, ScanWorker
+from ui.scan_worker import QueueScanWorker, ScanWorker, SingleCheckWorker
 from ui.widgets.profile_bar import ProfileBar
 from ui.widgets.status_bar import StatusBar
 
 APP_TITLE = "NVR 状态巡检"
-APP_VERSION = "2.2.0"
+APP_VERSION = "2.3.0"
 
 # macOS 红绿灯占位，避免和档案条叠在一起
 _MAC_TRAFFIC_PAD = 76
@@ -329,6 +329,8 @@ class MainWindow(QMainWindow):
         self.store = ConfigStore()
         self.settings = QSettings("NVRStatus", "NVRStatus")
         self.worker: Optional[ScanWorker | QueueScanWorker] = None
+        self.single_worker: Optional[SingleCheckWorker] = None
+        self._single_originals: List[Dict[str, Any]] = []
         self._theme_mode = self._load_theme_mode()
 
         self._build_ui()
@@ -525,6 +527,7 @@ class MainWindow(QMainWindow):
         results.export_requested.connect(self._export_result)
         results.log_requested.connect(self._log)
         results.layout_mode_changed.connect(self._on_results_layout_mode)
+        results.single_check_requested.connect(self._start_single_check)
         self.log_panel.expanded_changed.connect(lambda _on: self._apply_right_split())
         QTimer.singleShot(0, lambda: self._on_results_layout_mode(False))
 
@@ -765,11 +768,13 @@ class MainWindow(QMainWindow):
         self.left_panel.set_ffmpeg_status(bool(ff and fp))
 
     def _worker_busy(self) -> bool:
-        w = self.worker
-        if w is None:
-            return False
-        t = getattr(w, "_thread", None)
-        return t is not None and t.is_alive()
+        for w in (self.worker, self.single_worker):
+            if w is None:
+                continue
+            t = getattr(w, "_thread", None)
+            if t is not None and t.is_alive():
+                return True
+        return False
 
     def _start_scan(self, mode: str = "quick") -> None:
         if self._worker_busy():
@@ -893,6 +898,147 @@ class MainWindow(QMainWindow):
         self.worker = worker
         worker.start()
 
+    # ---------- 单路深度抽检（结果表选中通道） ----------
+
+    def _single_busy(self) -> bool:
+        w = self.single_worker
+        if w is None:
+            return False
+        t = getattr(w, "_thread", None)
+        return t is not None and t.is_alive()
+
+    def _start_single_check(self, recs: List[Dict[str, Any]]) -> None:
+        if not recs:
+            return
+        if self._worker_busy() or self._single_busy():
+            QMessageBox.information(self, "提示", "巡检/抽检正在进行中")
+            return
+        data = self.results_panel.last_result or {}
+        ip = str(data.get("ip") or "").strip()
+        prof = self.left_panel.form_to_profile_dict(self.store.get_active_name())
+        device = None
+        if ip:
+            device = next(
+                (
+                    d
+                    for d in prof.get("devices") or []
+                    if str(d.get("ip") or "").strip() == ip
+                ),
+                None,
+            )
+        if device is None or not device.get("ip"):
+            QMessageBox.warning(
+                self,
+                "错误",
+                "找不到结果对应的设备（档案可能已修改），请重新巡检后再试。",
+            )
+            return
+        if not device.get("password"):
+            if not QMessageBox.question(
+                self, "确认", "设备密码为空，是否继续？"
+            ) == QMessageBox.StandardButton.Yes:
+                return
+        tools = _which_tools()
+        if not (tools.get("ffmpeg") and tools.get("ffprobe")):
+            QMessageBox.warning(
+                self,
+                "缺少 ffmpeg",
+                "单路深度抽检需要 ffmpeg/ffprobe，当前未检测到。",
+            )
+            return
+
+        opt = dict(prof.get("scan_options") or {})
+        # 选中记录就是结果集里的原 dict（模型只存引用），抽检完成后按
+        # 身份回写，因此这里要留一份顺序一致的引用
+        self._single_originals = list(recs)
+        names = "、".join(
+            f"通道{r.get('通道')}"
+            + (
+                f"({r['名称']})"
+                if r.get("名称") and r.get("名称") != "未知"
+                else ""
+            )
+            for r in recs[:4]
+        ) + (f" 等{len(recs)}路" if len(recs) > 4 else "")
+        self._begin_single_check_ui(names)
+        self.log_panel.log(
+            f"—— 单路深度抽检 {names} · "
+            f"{device.get('name')} ({device.get('ip')}) ——",
+            level="step",
+        )
+
+        worker = SingleCheckWorker(device, opt, recs, self)
+        worker.log_line.connect(self._on_log_line)
+        worker.progress_update.connect(self._on_progress_update)
+        worker.check_finished.connect(self._on_single_check_finished)
+        worker.scan_failed.connect(self._on_single_check_failed)
+        worker.scan_cancelled.connect(self._on_single_check_cancelled)
+        self.single_worker = worker
+        worker.start()
+
+    def _begin_single_check_ui(self, names: str) -> None:
+        """单路抽检开始时的 UI 状态：运行日志自动打开 + 按钮互斥。
+
+        全量巡检靠 clear_result() 触发布局联动展开日志；单路抽检**不清结果**，
+        走不到那条路径，必须显式展开（notify 会联动 _apply_right_split 重算分栏）。
+        """
+        self.log_panel.set_expanded(True)
+        self.left_panel.set_scan_buttons_enabled(False)
+        self.left_panel.set_cancel_enabled(True)
+        self.results_panel.set_single_check_running(True)
+        self.status_bar.set_state("running", detail=f"单路抽检 · {names}")
+
+    def _finish_single_worker(self) -> None:
+        w = self.single_worker
+        self.single_worker = None
+        self._single_originals = []
+        if w is not None:
+            try:
+                w.setParent(None)
+            except Exception:
+                pass
+            w.deleteLater()
+        self.results_panel.set_single_check_running(False)
+        self._set_scan_buttons_enabled(True)
+        self.left_panel.set_cancel_enabled(False)
+
+    def _on_single_check_finished(self, updated: List[Dict[str, Any]]) -> None:
+        self.status_bar.set_progress(1.0, current=None, total=None)
+        originals = list(getattr(self, "_single_originals", []) or [])
+        self.results_panel.apply_single_check_result(originals, updated)
+        for u in updated:
+            v = u.get("视频抽检") or "未知"
+            a = u.get("音频抽检") or "未知"
+            detail = str(u.get("抽检详情") or "").strip()
+            line = f"单路抽检 通道 {u.get('通道')}: 视频 {v} · 音频 {a}"
+            if detail:
+                line += f" · {detail}"
+            if v == "正常" and a in ("正常", "跳过"):
+                level = "ok"
+            elif "异常" in (v, a):
+                level = "error"
+            else:
+                level = "warn"
+            self.log_panel.log(line, level=level)
+        self.status_bar.set_state("ready", detail="单路抽检完成")
+        self.log_panel.log("单路抽检完成。", level="ok")
+        self._finish_single_worker()
+
+    def _on_single_check_failed(self, err: str) -> None:
+        self._finish_single_worker()
+        brief = (
+            (err or "未知错误").strip().splitlines()[0] if err else "未知错误"
+        )
+        self.status_bar.set_state("error", detail=brief[:100])
+        self.log_panel.log(f"单路抽检失败: {brief}", level="error")
+        if "\n" in err:
+            self.log_panel.log(err[:500], level="muted")
+
+    def _on_single_check_cancelled(self) -> None:
+        self._finish_single_worker()
+        self.status_bar.set_state("ready", detail="单路抽检已取消")
+        self.log_panel.log("单路抽检已取消", level="warn")
+
     def _on_queue_device_finished(self, report: Dict[str, Any]) -> None:
         # 失败结果同样归档，便于历史回溯
         self._save_history(report)
@@ -968,10 +1114,14 @@ class MainWindow(QMainWindow):
 
     def _cancel_scan(self) -> None:
         w = self.worker
+        text = "正在取消巡检…"
+        if w is None:
+            w = self.single_worker
+            text = "正在取消单路抽检…"
         if w is not None:
             w.cancel()
             self.left_panel.set_cancel_enabled(False)
-            self.log_panel.log("正在取消巡检…", level="warn")
+            self.log_panel.log(text, level="warn")
 
     def _on_scan_cancelled(self) -> None:
         self._finish_worker(None)

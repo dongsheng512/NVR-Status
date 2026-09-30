@@ -6,10 +6,16 @@ B3：将「设备+选项 → HikvisionNVR」与「NVR → 统一结果 dict」�
 
 from __future__ import annotations
 
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from nvr_core.nvr import HikvisionNVR
-from nvr_core.util import Colors, ScanCancelled, _which_tools
+from nvr_core.util import (
+    Colors,
+    ScanCancelled,
+    _which_tools,
+    parse_channel_list,
+    parse_instant_list,
+)
 
 # 进度回调约定: progress_callback(msg: str = "", *, current=None, total=None, phase="", overall=None)
 ProgressCallback = Callable[..., None]
@@ -41,7 +47,8 @@ def build_nvr(
     device: {ip, port, username, password, ssl, name?}
     options: 与配置档案 scan_options 同键
       lookback / no_search / workers / deep_av_check / av_seconds / av_workers /
-      av_limit / silence_db / busy_start / busy_end / busy_days_ago / av_save / av_save_root
+      av_limit / av_channels / silence_db / busy_start / busy_end /
+      busy_days_ago / av_save / av_save_root
     default_save_root: 未显式指定 av_save_root 时的保存根目录（GUI 传 app data 目录）。
     """
     opt = options or {}
@@ -74,6 +81,32 @@ def build_nvr(
             )
 
     av_limit = opt.get("av_limit") or 0
+    # 抽检通道过滤(None=不过滤)。写错了不做静默降级：宁可提示后按「全部」走，
+    # 也不能让用户以为只抽了指定通道、实际抽了全部。
+    av_channels = opt.get("av_channels")
+    try:
+        av_channels = parse_channel_list(av_channels)
+    except ValueError as e:
+        _notify(
+            progress_callback,
+            quiet,
+            f"抽检通道过滤无效({e})，改为抽检全部候选通道",
+        )
+        av_channels = None
+    # 定点抽检时刻(None=不定点,沿用繁忙时段逻辑)。与通道过滤同一套理念:
+    # 写错不静默降级,提示后按「不定点」走,不能让用户以为查的是指定时刻。
+    # 这里预解析为 datetime 列表(按 busy_days_ago 落到 N 天前),非法即降级;
+    # HikvisionNVR 内部对 datetime 直通,不会再因格式二次报错。
+    av_at = opt.get("av_at")
+    try:
+        av_at = parse_instant_list(av_at, days_ago=busy_days_ago)
+    except ValueError as e:
+        _notify(
+            progress_callback,
+            quiet,
+            f"定点抽检时刻无效({e})，改为繁忙时段逻辑选点",
+        )
+        av_at = None
     save_root = (opt.get("av_save_root") or "").strip() or default_save_root
     # silence_db=0 / busy_start=0 是合法值,不能用 or 兜底(会被吞成默认)
     silence_db = opt.get("silence_db")
@@ -92,6 +125,8 @@ def build_nvr(
         av_seconds=int(opt.get("av_seconds") or 6),
         av_workers=int(opt.get("av_workers") or 2),
         av_limit=int(av_limit) if av_limit and int(av_limit) > 0 else None,
+        av_channels=av_channels,
+        av_at=av_at,
         silence_db=-80.0 if silence_db is None else float(silence_db),
         busy_start_hour=10 if busy_start is None else int(busy_start),
         busy_end_hour=18 if busy_end is None else int(busy_end),
@@ -114,8 +149,8 @@ def run_nvr(
     结果键（CLI 与 GUI 共用）：
       device_name / ip / info / sys_status / health / alarms / cameras / records /
       drives / disk_overwrite / lookback_minutes / deep_av_check / deep_av(别名) /
-      av_seconds / av_workers / busy_start_hour / busy_end_hour / av_save /
-      av_save_dir / check_disk_recording / error
+      av_seconds / av_workers / av_channels / busy_start_hour / busy_end_hour /
+      av_save / av_save_dir / check_disk_recording / error
     """
 
     def progress(msg: str = "", **kw: Any) -> None:
@@ -177,6 +212,7 @@ def run_nvr(
         "deep_av": nvr.deep_av_check,
         "av_seconds": nvr.av_seconds,
         "av_workers": nvr.av_workers,
+        "av_channels": sorted(nvr.av_channels) if nvr.av_channels else [],
         "busy_start_hour": nvr.busy_start_hour,
         "busy_end_hour": nvr.busy_end_hour,
         "av_save": nvr.av_save,
@@ -206,6 +242,7 @@ def _error_report(
         "deep_av": bool(getattr(nvr, "deep_av_check", False)),
         "av_seconds": getattr(nvr, "av_seconds", 0) or 0,
         "av_workers": getattr(nvr, "av_workers", 0) or 0,
+        "av_channels": sorted(getattr(nvr, "av_channels", None) or []),
         "busy_start_hour": getattr(nvr, "busy_start_hour", 0) or 0,
         "busy_end_hour": getattr(nvr, "busy_end_hour", 0) or 0,
         "av_save": bool(getattr(nvr, "av_save", False)),
@@ -236,6 +273,91 @@ def scan(
         return run_nvr(nvr, device_name=device_name, progress_callback=progress_callback)
     finally:
         nvr.close()
+
+
+AV_FIELDS = (
+    "视频抽检",
+    "音频抽检",
+    "抽检详情",
+    "抽检时段",
+    "video_codec",
+    "audio_codec",
+    "resolution",
+    "mean_volume_db",
+    "保存路径",
+)
+
+
+def run_single_av_check(
+    recs: List[Dict[str, Any]],
+    device: Dict[str, Any],
+    options: Optional[Dict[str, Any]] = None,
+    *,
+    quiet: bool = True,
+    progress_callback: Optional[ProgressCallback] = None,
+    default_save_root: Optional[str] = None,
+    on_nvr: Optional[Callable[[HikvisionNVR], None]] = None,
+) -> List[Dict[str, Any]]:
+    """单路深度抽检：对上次巡检结果里的选中通道重跑音视频抽检。
+
+    GUI 结果表选中一行(或多行)后触发。**复用巡检时的通道记录**(已含
+    track_id / 录像含音频 / 落盘状态等),不再重复状态/落盘等全量检查;
+    返回每条记录的**副本**(抽检字段已更新),由调用方回写 UI,原记录不动。
+
+    选项强制:deep_av_check=True、av_channels=选中通道、av_limit=None、
+    av_save=False(单路复查不落盘,保持行为可预期)。
+
+    通道号先自行校验:非法/非数字(如 Track 解析失败留下的「未知」)直接抛
+    ValueError —— 绝不能让它退化成 build_nvr 里的「过滤无效 → 抽检全部
+    候选通道」,那等于点一路查整机。
+
+    on_nvr: NVR 构建完成后回调(GUI 用于持住实例以支持取消)。
+
+    连接/抽检失败抛出异常(与 run_nvr 一致);单条通道被判定「未配置录像 /
+    近期无录像」等不算失败 —— 会写进返回记录的抽检详情里。
+    """
+    if not recs:
+        return []
+    work = [dict(r) for r in recs]
+    channels: List[int] = []
+    for r in work:
+        raw = str(r.get("通道") or "").strip()
+        if not raw:
+            continue
+        try:
+            parsed = parse_channel_list(raw)
+        except ValueError:
+            parsed = None
+        if not parsed:
+            raise ValueError(f"选中记录的通道号无效: {raw!r},无法定点抽检")
+        channels.extend(sorted(parsed))
+    if not channels:
+        raise ValueError("选中记录缺少通道号,无法抽检")
+    channels = sorted(set(channels))
+
+    opt = dict(options or {})
+    opt["deep_av_check"] = True
+    opt["av_save"] = False
+    opt["av_channels"] = ",".join(str(c) for c in channels)
+    opt["av_limit"] = None
+
+    nvr = build_nvr(
+        device,
+        opt,
+        quiet=quiet,
+        progress_callback=progress_callback,
+        default_save_root=default_save_root,
+    )
+    if on_nvr is not None:
+        try:
+            on_nvr(nvr)
+        except Exception:
+            pass
+    try:
+        nvr._run_deep_av_checks(work)
+    finally:
+        nvr.close()
+    return work
 
 
 def scan_queue(

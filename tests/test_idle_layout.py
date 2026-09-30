@@ -202,3 +202,111 @@ def test_profile_bar_empty_press_does_not_crash(qapp):
         Qt.KeyboardModifier.NoModifier,
     )
     bar.mousePressEvent(ev)
+
+
+# ---------- 设备删除：保留集先定、后动控件 ----------
+
+
+class _DummyBox:
+    """替代 QMessageBox：记录调用，避免弹出模态框。"""
+
+    calls: list = []
+
+    @staticmethod
+    def warning(*args, **kwargs):
+        _DummyBox.calls.append(("warning", args[1:]))
+
+    @staticmethod
+    def information(*args, **kwargs):
+        _DummyBox.calls.append(("information", args[1:]))
+
+
+def _panel_with_devices(qapp, names):
+    from ui.panels import left_panel as left_panel_mod
+
+    panel = LeftPanel()
+    panel._clear_device_rows()
+    panel._device_rows = []
+    for i, name in enumerate(names, start=1):
+        panel._add_device_row(
+            {
+                "name": name,
+                "ip": f"10.0.0.{i}",
+                "port": 80,
+                "username": "admin",
+                "password": "",
+                "ssl": False,
+            }
+        )
+    return panel, left_panel_mod
+
+
+def test_delete_all_rebuilds_without_ghost_targets(qapp, monkeypatch):
+    """全删后兜底补一台：中途不得让扫描目标看到已删除设备。
+
+    回归：原先先 _add_device_row() 再把 keep 写回 _device_rows，
+    于是兜底那一次 _refresh_scan_target() 会在「_device_rows 仍含已删设备」
+    的中途执行，下拉短暂出现 NVR2/NVR3 幽灵项。
+    """
+    panel, mod = _panel_with_devices(qapp, ["NVR1", "NVR2", "NVR3"])
+    monkeypatch.setattr(mod, "QMessageBox", _DummyBox)
+    _DummyBox.calls = []
+    for r in panel._device_rows:
+        r["chk"].setChecked(True)
+
+    observed: list = []
+    orig_refresh = panel._refresh_scan_target
+
+    def spy_refresh():
+        observed.append(len(panel._collect_devices()))
+        return orig_refresh()
+
+    panel._refresh_scan_target = spy_refresh
+    try:
+        panel._del_device()
+    finally:
+        panel._refresh_scan_target = orig_refresh
+
+    assert any(c[0] == "warning" for c in _DummyBox.calls), "应提示至少保留一台设备"
+    assert max(observed) <= 1, f"扫描目标中途看到了幽灵设备: {observed}"
+    assert observed[-1] == 1
+    assert len(panel._device_rows) == 1
+    assert panel.dev_list.count() == 1
+    assert len(panel._collect_devices()) == 1
+    texts = [
+        panel.cmb_scan_target.itemText(i) for i in range(panel.cmb_scan_target.count())
+    ]
+    assert not any("NVR2" in t or "NVR3" in t for t in texts), texts
+    assert any("全部设备（1 台）" in t for t in texts), texts
+
+
+def test_delete_only_checked_keeps_others_consistent(qapp, monkeypatch):
+    """删中间一台：控件数、_device_rows、扫描目标三者保持一致。"""
+    panel, mod = _panel_with_devices(qapp, ["NVR1", "NVR2", "NVR3"])
+    monkeypatch.setattr(mod, "QMessageBox", _DummyBox)
+    _DummyBox.calls = []
+    panel._device_rows[1]["chk"].setChecked(True)
+
+    panel._del_device()
+
+    assert [d["name"] for d in panel._collect_devices()] == ["NVR1", "NVR3"]
+    assert [r["device"]["name"] for r in panel._device_rows] == ["NVR1", "NVR3"]
+    assert panel.dev_list.count() == 2
+    texts = [
+        panel.cmb_scan_target.itemText(i) for i in range(panel.cmb_scan_target.count())
+    ]
+    assert not any("NVR2" in t for t in texts), texts
+    assert any("全部设备（2 台）" in t for t in texts), texts
+
+
+def test_delete_without_selection_is_noop(qapp, monkeypatch):
+    """没勾选任何设备：只提示，不改状态。"""
+    panel, mod = _panel_with_devices(qapp, ["NVR1", "NVR2"])
+    monkeypatch.setattr(mod, "QMessageBox", _DummyBox)
+    _DummyBox.calls = []
+
+    panel._del_device()
+
+    assert any(c[0] == "information" for c in _DummyBox.calls)
+    assert len(panel._device_rows) == 2
+    assert panel.dev_list.count() == 2

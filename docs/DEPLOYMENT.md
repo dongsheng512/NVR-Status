@@ -1,6 +1,6 @@
 # 部署与分发文档
 
-> 适用版本：2.2.0（PySide6 GUI）  
+> 适用版本：2.3.0（PySide6 GUI）  
 > 目标：同事 **安装即用**（状态巡检 + 可选深度抽检 + 多配置档案）  
 > GUI 已由 CustomTkinter 重写为 PySide6，见 [PLAN.md](PLAN.md)。
 
@@ -170,9 +170,20 @@ uv run pyinstaller --noconfirm NVRStatus.spec
 3. 目标平台构建 + 捆绑 ffmpeg（若需要深度抽检）
 4. 压缩产物，命名：NVRStatus-{macOS|Windows}-{version}.zip
 5. 附简短「首次打开说明」（未签名 Mac / 解压路径）
-6. 内网盘或私有仓库 Release 分发（本仓库 GitHub 为 Private）
+6. 内网盘或 Release 分发
 7. 记录构建机 OS 版本、Python 版本、是否含 ffmpeg
 ```
+
+> ⚠️ **脱敏提醒（提交/上传前必做）**：`https://github.com/dongsheng512/NVR-Status` 实际为
+> **Public**（`gh repo view --json visibility` 实测；本文早前误记为 Private）。
+> 推上去即全网可见且进入 git 历史，**历史无法改写**。三个高发区：
+>
+> - `USAGE.md` 的配置示例 —— 曾写入真实内网 IP
+> - `docs/` 的真机验证记录 —— 曾写入真实 NVR 名与摄像头名
+> - `tests/` 的 fixture —— 曾用真实摄像头名做测试数据
+>
+> 用示例值（`192.168.1.64` / `前端相机-1` / `NVR-A`）替换。
+> 本地档案 `~/Library/Application Support/NVRStatus/profiles.json` 在仓库外，不受影响。
 
 ### 5.1 建议附带的用户说明（可复制）
 

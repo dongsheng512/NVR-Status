@@ -13,7 +13,7 @@ packages = ["ui", "ui.panels", "ui.widgets", "services", "nvr_core"]
 
 [project]
 name = "cam"
-version = "2.2.0"
+version = "2.3.0"
 description = "海康 NVR 状态巡检与音视频抽检（CLI + GUI）"
 requires-python = ">=3.11"
 dependencies = [
@@ -25,14 +25,12 @@ dependencies = [
 [project.scripts]
 nvr-gui = "ui.app:main"
 
-[project.optional-dependencies]
-build = [
-    "pyinstaller>=6.0.0",
-]
-
 [dependency-groups]
 dev = [
     "pytest>=8.0.0",
+    # 打包用。放 dev 组而不是 optional extra:uv sync 默认装 dev 组,
+    # 否则每次 sync 会把 pip 手装的 pyinstaller 清掉,打包脚本就得补救
+    "pyinstaller>=6.0.0",
 ]
 
 [tool.pytest.ini_options]

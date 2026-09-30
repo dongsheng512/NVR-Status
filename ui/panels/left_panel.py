@@ -298,7 +298,10 @@ class LeftPanel(QWidget):
         self.sp_busy_start.setToolTip("该日繁忙时段开始小时（本地时间）")
         self.sp_busy_end = self._make_spinbox(1, 24)
         self.sp_busy_end.setSuffix(" 时")
-        self.sp_busy_end.setToolTip("该日繁忙时段结束小时（本地时间，不含该点）")
+        self.sp_busy_end.setToolTip(
+            "该日繁忙时段结束小时（本地时间，不含该点）。"
+            "实际抽检点距现在至少 10 分钟，避开刚写入的回放。"
+        )
         self.sp_silence = self._make_double_spinbox(-120.0, 0.0, decimals=1, step=1.0)
         self.sp_silence.setSuffix(" dB")
 
@@ -781,24 +784,26 @@ class LeftPanel(QWidget):
         return base
 
     def _del_device(self) -> None:
-        keep = []
-        for r in self._device_rows:
-            if r["chk"].isChecked():
-                idx = self.dev_list.indexOf(r["chk"].parentWidget())
-                if idx >= 0:
-                    item = self.dev_list.takeAt(idx)
-                    if item.widget() is not None:
-                        item.widget().deleteLater()
-            else:
-                keep.append(r)
-        if len(keep) == len(self._device_rows):
+        checked = [r for r in self._device_rows if r["chk"].isChecked()]
+        if not checked:
             QMessageBox.information(self, "提示", "请先勾选要删除的设备")
             return
+        # 先把保留集定下来并写回 _device_rows，再动控件。
+        # 否则兜底补设备时 _add_device_row() 会在「_device_rows 仍含已删设备」
+        # 的中途调用 _refresh_scan_target()，让扫描目标下拉短暂出现幽灵设备。
+        keep = [r for r in self._device_rows if not r["chk"].isChecked()]
         if not keep:
             QMessageBox.warning(self, "提示", "至少保留一台设备")
-            self._add_device_row()
-            keep = [self._device_rows[-1]]
         self._device_rows = keep
+        for r in checked:
+            idx = self.dev_list.indexOf(r["row"])
+            if idx >= 0:
+                item = self.dev_list.takeAt(idx)
+                if item.widget() is not None:
+                    item.widget().deleteLater()
+        if not self._device_rows:
+            # 不允许删空：_device_rows 此刻已清空，补一台不会带上已删设备
+            self._add_device_row()
         self._refresh_scan_target()
         self._refresh_device_toggle_label()
 

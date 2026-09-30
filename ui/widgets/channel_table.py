@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
 
-from PySide6.QtCore import QAbstractTableModel, QModelIndex, QSortFilterProxyModel, Qt, Signal
+from PySide6.QtCore import QAbstractTableModel, QModelIndex, QSize, QSortFilterProxyModel, Qt, Signal
 from PySide6.QtGui import QColor, QFont, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -40,15 +40,16 @@ COLUMN_LABELS = {
     "achk": "音频抽检",
 }
 COLUMN_WIDTHS = {
-    "ch": 60,
-    "name": 200,
-    "online": 60,
-    "audio": 68,
-    "disk": 90,
-    "record": 76,
-    "vchk": 86,
-    "achk": 86,
+    "ch": 56,
+    "name": 180,
+    "online": 52,
+    "audio": 64,
+    "disk": 80,
+    "record": 64,
+    "vchk": 80,
+    "achk": 80,
 }
+NAME_MIN_WIDTH = 140
 
 
 def row_tag(rec: Dict[str, Any], deep: bool) -> str:
@@ -60,9 +61,10 @@ def row_tag(rec: Dict[str, Any], deep: bool) -> str:
     ):
         return "error"
     if deep and (
-        rec.get("视频抽检") == "异常" or rec.get("音频抽检") in ("异常", "警告")
+        rec.get("视频抽检") == "异常"
+        or rec.get("音频抽检") in ("异常", "警告", "未知")
     ):
-        return "warn" if rec.get("音频抽检") == "警告" else "error"
+        return "warn" if rec.get("音频抽检") in ("警告", "未知") else "error"
     if rec.get("落盘状态") == "跳过" or rec.get("录像是否正常") in ("未知", "跳过"):
         return "muted"
     return "ok"
@@ -132,6 +134,20 @@ class ChannelTableModel(QAbstractTableModel):
             return self._records[row]
         return None
 
+    def update_record_fields(self, rec: Dict[str, Any], fields: Dict[str, Any]) -> bool:
+        """按对象身份就地更新一条记录并刷新对应行(不动排序/选择)。
+
+        记录 dict 由外部持有(set_records 只存引用),GUI 后台任务回写
+        抽检结果时用 identity 匹配,避免同内容记录被误更新。
+        """
+        for i, r in enumerate(self._records):
+            if r is rec:
+                r.update(fields)
+                last = max(len(self.columns()) - 1, 0)
+                self.dataChanged.emit(self.index(i, 0), self.index(i, last))
+                return True
+        return False
+
     # ---- Qt API ----
     def rowCount(self, parent=QModelIndex()) -> int:
         return 0 if parent.isValid() else len(self._records)
@@ -171,8 +187,12 @@ class ChannelTableModel(QAbstractTableModel):
         return None
 
     def headerData(self, section: int, orientation: Qt.Orientation, role=Qt.ItemDataRole.DisplayRole):
-        if orientation == Qt.Orientation.Horizontal and role == Qt.ItemDataRole.DisplayRole:
-            return COLUMN_LABELS.get(self.columns()[section], "")
+        cols = self.columns()
+        if orientation == Qt.Orientation.Horizontal:
+            if role == Qt.ItemDataRole.DisplayRole:
+                return COLUMN_LABELS.get(cols[section], "")
+            if role == Qt.ItemDataRole.SizeHintRole and cols[section] == "name":
+                return QSize(NAME_MIN_WIDTH, 24)
         if orientation == Qt.Orientation.Vertical and role == Qt.ItemDataRole.DisplayRole:
             return str(section + 1)
         return None
@@ -240,12 +260,16 @@ class ChannelTableView(QWidget):
     export_requested = Signal()
     expand_requested = Signal()
     detail_requested = Signal(object)
+    single_check_requested = Signal(list)  # 选中的记录列表
 
     def __init__(self, parent=None, *, show_result_actions: bool = True):
         super().__init__(parent)
         self._deep = False
         self._dark = False
+        self._name_mode: Optional[QHeaderView.ResizeMode] = None
         self._show_result_actions = show_result_actions
+        self._actions_enabled = False
+        self._single_check_running = False
 
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
@@ -282,12 +306,24 @@ class ChannelTableView(QWidget):
         self.btn_expand.setFixedHeight(24)
         self.btn_expand.clicked.connect(self.expand_requested.emit)
 
+        self.btn_single_check = QPushButton("单路抽检")
+        self.btn_single_check.setObjectName("FormField")
+        self.btn_single_check.setToolTip(
+            "对选中通道重新做一次音视频深度抽检(需 ffmpeg)\n"
+            "先在表中点选通道行,再点本按钮;也可用右键菜单"
+        )
+        self.btn_single_check.setEnabled(False)
+        self.btn_single_check.setFixedHeight(24)
+        self.btn_single_check.clicked.connect(self._emit_single_check)
+
         if show_result_actions:
             toolbar.addWidget(self.btn_export)
             toolbar.addWidget(self.btn_expand)
+            toolbar.addWidget(self.btn_single_check)
         else:
             self.btn_export.hide()
             self.btn_expand.hide()
+            self.btn_single_check.hide()
         root.addWidget(self.toolbar_host)
 
         self.model = ChannelTableModel(self)
@@ -304,12 +340,10 @@ class ChannelTableView(QWidget):
         self.view.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.view.verticalHeader().setDefaultSectionSize(24)
         self.view.verticalHeader().setVisible(True)
-        self.view.horizontalHeader().setStretchLastSection(False)
-        header = self.view.horizontalHeader()
-        header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
-        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-        for i, col in enumerate(BASE_COLUMNS):
-            self.view.setColumnWidth(i, COLUMN_WIDTHS[col])
+        self.view.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.view.setHorizontalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
+        self.view.setTextElideMode(Qt.TextElideMode.ElideRight)
+        self._apply_column_layout()
         self.view.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.view.customContextMenuRequested.connect(self._show_context_menu)
 
@@ -332,6 +366,9 @@ class ChannelTableView(QWidget):
 
         QShortcut(QKeySequence("Ctrl+C"), self.view, activated=self.copy_selection)
         QShortcut(QKeySequence("Ctrl+Shift+C"), self.view, activated=self.copy_all)
+        self.view.selectionModel().selectionChanged.connect(
+            self._update_single_check_enabled
+        )
 
         self._sync_stack()
 
@@ -343,14 +380,64 @@ class ChannelTableView(QWidget):
     def set_records(self, records: Optional[List[Dict[str, Any]]], deep: bool) -> None:
         self._deep = bool(deep)
         self.model.set_records(records, deep)
-        cols = DEEP_COLUMNS if self._deep else BASE_COLUMNS
         self.view.setSortingEnabled(False)
-        for i, col in enumerate(cols):
-            self.view.setColumnWidth(i, COLUMN_WIDTHS[col])
-            self.view.setColumnHidden(i, False)
+        self._apply_column_layout()
         self.view.setSortingEnabled(True)
         self._refresh_count()
         self._sync_stack()
+        # 模型重置会清空选中；显式同步一次按钮状态，别依赖 selectionChanged
+        self._update_single_check_enabled()
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        if self.model.rowCount():
+            self._balance_name_column()
+
+    def _apply_column_layout(self) -> None:
+        """状态列固定宽度，名称列吃剩余空间，且不低于 NAME_MIN_WIDTH。"""
+        cols = DEEP_COLUMNS if self._deep else BASE_COLUMNS
+        header = self.view.horizontalHeader()
+        header.setStretchLastSection(False)
+        header.setMinimumSectionSize(48)
+        name_idx = cols.index("name")
+        for i, col in enumerate(cols):
+            self.view.setColumnHidden(i, False)
+            header.setSectionResizeMode(i, QHeaderView.ResizeMode.Interactive)
+            if col != "name":
+                self.view.setColumnWidth(i, COLUMN_WIDTHS[col])
+        self.view.setColumnWidth(name_idx, COLUMN_WIDTHS["name"])
+        # 列集合/宽度已重置，清掉缓存让 _balance_name_column 重新判定模式
+        self._name_mode = None
+        self._balance_name_column()
+
+    def _balance_name_column(self) -> None:
+        """宽裕时名称列 Stretch 吃满，不足 NAME_MIN_WIDTH 时退回 Interactive。
+
+        只在**模式真正需要切换**时才调 setSectionResizeMode：该方法会触发
+        表头重新布局，而布局又会回调 resizeEvent → 再次进入本函数，反复设置
+        会造成列宽抖动（拖窗口时名称列一闪一闪）。
+        """
+        cols = DEEP_COLUMNS if self._deep else BASE_COLUMNS
+        if "name" not in cols:
+            return
+        name_idx = cols.index("name")
+        header = self.view.horizontalHeader()
+        others = sum(
+            self.view.columnWidth(i) for i in range(len(cols)) if i != name_idx
+        )
+        avail = self.view.viewport().width() - others
+        want = (
+            QHeaderView.ResizeMode.Stretch
+            if avail >= NAME_MIN_WIDTH
+            else QHeaderView.ResizeMode.Interactive
+        )
+        if getattr(self, "_name_mode", None) != want:
+            header.setSectionResizeMode(name_idx, want)
+            self._name_mode = want
+        if want == QHeaderView.ResizeMode.Interactive:
+            # Interactive 下模式切换不会自动改宽度，需显式顶到下限
+            if self.view.columnWidth(name_idx) != NAME_MIN_WIDTH:
+                self.view.setColumnWidth(name_idx, NAME_MIN_WIDTH)
 
     def set_dark(self, dark: bool) -> None:
         self._dark = dark
@@ -361,8 +448,29 @@ class ChannelTableView(QWidget):
 
     def set_result_actions_enabled(self, enabled: bool) -> None:
         """启用/禁用导出与大窗按钮。"""
+        self._actions_enabled = bool(enabled)
         self.btn_export.setEnabled(enabled)
         self.btn_expand.setEnabled(enabled)
+        self._update_single_check_enabled()
+
+    def set_single_check_running(self, running: bool) -> None:
+        """单路抽检进行中：按钮禁用并在结束后恢复可用性判定。"""
+        self._single_check_running = bool(running)
+        self._update_single_check_enabled()
+
+    def _update_single_check_enabled(self, *_args) -> None:
+        ok = (
+            self._show_result_actions
+            and self._actions_enabled
+            and not self._single_check_running
+            and bool(self.selected_records())
+        )
+        self.btn_single_check.setEnabled(ok)
+
+    def _emit_single_check(self) -> None:
+        recs = self.selected_records()
+        if recs:
+            self.single_check_requested.emit(recs)
 
     def _refresh_count(self) -> None:
         n = self.proxy.rowCount()
@@ -415,6 +523,13 @@ class ChannelTableView(QWidget):
         menu.addSeparator()
         act_detail = menu.addAction("通道详情")
         act_detail.triggered.connect(self._emit_detail)
+        act_single = menu.addAction("单路深度抽检")
+        act_single.setEnabled(
+            self._actions_enabled
+            and not self._single_check_running
+            and bool(self.selected_records())
+        )
+        act_single.triggered.connect(self._emit_single_check)
         act_export = menu.addAction("导出结果…")
         act_export.triggered.connect(self.export_requested)
         menu.exec(self.view.viewport().mapToGlobal(pos))

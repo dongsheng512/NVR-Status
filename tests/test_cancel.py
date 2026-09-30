@@ -3,11 +3,50 @@
 from __future__ import annotations
 
 import time
+import xml.etree.ElementTree as ET
 
 import pytest
 
 from hikvision_status import HikvisionNVR, ScanCancelled
 from ui.scan_worker import ScanWorker, _SignalThrottle
+
+
+def _tracks_root(tid: str = "101") -> ET.Element:
+    """单 Track、已配置录像的最小 /ContentMgmt/record/tracks 响应。"""
+    return ET.fromstring(
+        f"""<TrackList><Track>
+  <id>{tid}</id>
+  <DefaultRecordingMode>CMR</DefaultRecordingMode>
+  <Actions>
+    <ActionRecordingMode>CMR</ActionRecordingMode>
+    <Record>true</Record>
+  </Actions>
+</Track></TrackList>"""
+    )
+
+
+def test_disk_search_cancel_propagates_not_nameerror():
+    """落盘检索阶段取消必须抛 ScanCancelled。
+
+    回归：`except ScanCancelled:` 所引用的名字没有 import，
+    取消一触发就先炸 NameError（把真正的取消异常吞掉）。
+    注意：取消标志必须在**线程池已开跑之后**才置位 —— `_progress` 本身
+    就是取消检查点，若提前置位，异常会从池外的 `_progress` 抛出，
+    根本走不进 `except ScanCancelled:`，测试就成了假绿。
+    """
+    nvr = HikvisionNVR(
+        ip="127.0.0.1", port=80, username="a", password="b", quiet=True
+    )
+    nvr._parse = lambda endpoint, tag="": _tracks_root()  # type: ignore[method-assign]
+    nvr.get_cameras = lambda: []  # type: ignore[method-assign]
+
+    def _cancel_mid_pool(track_id, lookback_minutes):
+        nvr._cancelled.set()  # 模拟用户在落盘检索运行中点了取消
+        raise ScanCancelled("巡检已取消")
+
+    nvr._search_track_recent = _cancel_mid_pool  # type: ignore[method-assign]
+    with pytest.raises(ScanCancelled):
+        nvr.get_recording_status()
 
 
 def test_nvr_cancel_raises_scan_cancelled():

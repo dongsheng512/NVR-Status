@@ -227,12 +227,25 @@ class ConfigStore:
         return True
 
     def get_profile(self, name: Optional[str] = None) -> Dict[str, Any]:
+        """返回档案内容的**快照**（深拷贝），缺省字段已补全。
+
+        只读语义，有两个必须守住的不变量：
+
+        1. 不向 ``self.data`` 登记新档案。读取一个不存在的档案名只返回一份
+           补全后的默认快照，不会把它写进 store（否则 `list_profiles()` 会凭空
+           多出一项）。
+        2. 返回值与内部对象完全解耦。调用方（如 GUI 的
+           `_load_active_profile_to_form`）会把 ``resolve_devices()`` 取回的
+           **明文密码**塞进返回值；若返回值就是 `self.data` 里的那个字典，
+           明文会写进内存并随下一次 `save()` 落进 profiles.json，等于把
+           keyring 设计整个抹掉。
+
+        需要落盘的改动请显式走 ``update_profile()`` / ``save()``。
+        """
         name = name or self.get_active_name()
-        prof = self.data["profiles"].get(name)
-        if not prof:
-            prof = _default_profile(name)
-            self.data["profiles"][name] = prof
-        # 补全缺省字段
+        stored = self.data.get("profiles", {}).get(name)
+        prof = deepcopy(stored) if stored else _default_profile(name)
+        # 补全缺省字段（只作用于快照）
         if "scan_options" not in prof:
             prof["scan_options"] = _default_scan_options()
         else:
@@ -377,7 +390,7 @@ class ConfigStore:
         导出含运行时明文密码（便于迁移到他机）；导入侧会再迁入 keyring。
         写入失败时清理半截文件,POSIX 下收紧文件权限(0o600)。
         """
-        prof = deepcopy(self.get_profile(name))
+        prof = self.get_profile(name)  # 已是快照
         prof["devices"] = self.resolve_devices(name)
         parent = os.path.dirname(os.path.abspath(path)) or "."
         fd, tmp = tempfile.mkstemp(prefix=".nvr-export-", suffix=".tmp", dir=parent)
