@@ -69,7 +69,7 @@ def test_profile_bar_delete_disabled_when_only_one(qapp):
     bar.set_profiles(["默认"], "默认")
     assert not bar.act_delete.isEnabled()
     assert not bar.act_delete.defaultWidget().isEnabled()
-    bar.set_profiles(["钱江录像机", "备份"], "钱江录像机")
+    bar.set_profiles(["测试档案", "备份"], "测试档案")
     assert bar.act_delete.isEnabled()
     assert bar.act_delete.defaultWidget().isEnabled()
-    assert bar.active() == "钱江录像机"
+    assert bar.active() == "测试档案"
