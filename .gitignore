@@ -33,6 +33,9 @@ bin/libs/
 # 会话/临时笔记（非项目文档）
 cam.md
 
+# 开发笔记只留在本机，不进 GitHub
+docs/
+
 # 本地代理/会话缓存
 .mimosa/
 
